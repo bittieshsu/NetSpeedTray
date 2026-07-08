@@ -173,7 +173,8 @@ Double-click the widget (or pick **Monitor** from the right-click menu) to open 
 1. **Install** with the Winget command [above](#install) (or the installer).
 2. **Right-click the widget** - open **Settings** or the **Monitor**, **Pause/Resume** monitoring, or **Exit**. The top of the menu shows your data used today / this month at a glance.
 3. **Double-click the widget** to open the **Monitor** (history, per-app activity, hardware, statistics).
-4. **Want temperatures?** Most NVIDIA/Intel systems show them out of the box. For full coverage (or any AMD CPU), install and run [LibreHardwareMonitor **v0.9.4**](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor/releases/tag/v0.9.4) as Administrator (v0.9.5+ removed the interface NetSpeedTray reads).
+4. **Drag it to reposition** - grab the widget and drag it along the taskbar to wherever you like; it remembers the spot. Turn on **Free Move (No Snapping)** in Settings to place it anywhere, including off the taskbar.
+5. **Want temperatures?** Most NVIDIA/Intel systems show them out of the box. For full coverage (or any AMD CPU), install and run [LibreHardwareMonitor **v0.9.4**](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor/releases/tag/v0.9.4) as Administrator (v0.9.5+ removed the interface NetSpeedTray reads).
 
 ---
 
@@ -183,7 +184,7 @@ Double-click the widget (or pick **Monitor** from the right-click menu) to open 
 Task Manager shows network speed too - but you have to *open* it, and it disappears the moment you click away. NetSpeedTray lives permanently on your taskbar with sub-second updates, in the corner of your eye while you work.
 
 **Will it slow down my PC?**
-Idle RAM is about **50 MB** - that's the number Windows Task Manager shows you (its *full* working set, which counts the shared Windows/Qt DLLs it maps, is ~90 MB), and CPU sits near zero between polls (~0.1%). The Monitor's Overview tab is deliberately chart-free, so glancing at it stays light; opening the Network or Hardware **charts** loads the plotting library once for the session. The widget polls every ~1 second using the same Windows APIs Task Manager uses.
+Idle RAM is about **50 MB** - that's the number Windows Task Manager shows you (its *full* working set, which counts the shared Windows/Qt DLLs it maps, is ~90 MB), and CPU sits near zero between polls (~0.1%). The Monitor's Overview tab is deliberately chart-free, so glancing at it stays light; opening the Network or Hardware **charts** loads the plotting library for the session, which adds roughly **50-60 MB** while the Monitor is open - close the Monitor and it eases back down. The widget polls every ~1 second using the same Windows APIs Task Manager uses.
 
 **Do I need LibreHardwareMonitor?**
 Often no - see the [hardware table above](#hardware-monitoring---do-i-need-librehardwaremonitor). Usage stats and NVIDIA/Intel temps & power work natively; LHM (run as admin, **v0.9.4** - v0.9.5+ dropped the interface we read) is the universal fallback and the realistic way to get **AMD CPU** temperature and power. The widget never asks for admin itself.
@@ -246,7 +247,8 @@ You probably grabbed an unsigned dev build. The official releases ([Setup.exe / 
 
 ### Positioning & Integration
 - **Taskbar-docked** - stays above the taskbar through the Start menu, flyovers, and the tray overflow
-- **Preferred monitor** - pin to a specific display; **free-move** anywhere, including off-taskbar
+- **Drag to reposition** - drag the widget to move it along the taskbar; your spot is remembered. **Free Move (No Snapping)** lets you place it anywhere, including off the taskbar
+- **Preferred monitor** - pin to a specific display (auto free-floats on a taskbar-less screen)
 - **Survives** sleep/resume, monitor add/remove/primary-swap, and Explorer restarts
 - **Vertical taskbar** + **high-DPI** aware
 
