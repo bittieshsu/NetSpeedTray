@@ -128,6 +128,7 @@ class NetworkSpeedWidget(QWidget):
         self.network_identity: Optional[object] = None  # NetworkIdentity|None: Wi-Fi band/SSID, set by update_network_identity (v2.1)
         self._identity_reserve_sig_last: object = None  # last identity reserve signature (band-shown, ssid); re-layout on change
         self._location_prompt_shown: bool = False  # SSID Location nudge shown at most once per session
+        self._widgets_nudge_shown: bool = False  # #200 Widgets/weather overlap nudge, once per session
         self.gpu_present: bool = False  # LATCHES True once any poll detects GPU counters (never flips
         #                                 back - a GPU doesn't vanish), so the Monitor's GPU tile shows
         #                                 stably for a real/integrated GPU and stays hidden only on a
@@ -341,6 +342,18 @@ class NetworkSpeedWidget(QWidget):
 
 
 
+    def _on_immediate_hide_requested(self) -> None:
+        """Handle the fast fullscreen-obstruction hide, honoring the two states that must
+        stay visible: the user's keep_visible_fullscreen choice (#107), and runtime
+        free-float (#188) - where a taskbar-less preferred monitor falls back to the
+        primary taskbar, so a fullscreen app on the primary would otherwise transiently
+        hide the off-taskbar widget. Mirrors the visibility gate in _execute_refresh()."""
+        if self.config.get("keep_visible_fullscreen", False):
+            return
+        if self.position_manager and self.position_manager.is_free_float_active():
+            return
+        self.setVisible(False)
+
     def _execute_refresh(self, hwnd: int = 0) -> None:
         """
         The AUTHORITATIVE refresh trigger. This version includes a grace period
@@ -376,20 +389,35 @@ class NetworkSpeedWidget(QWidget):
             if hwnd == 0:
                 hwnd = win32gui.GetForegroundWindow()
 
+            # #188: is the preferred monitor a taskbar-less display we should free-float on?
+            free_float_active = self.position_manager.refresh_float_state() is not None
+
             # Allow user override to keep widget visible even when a fullscreen window is present
             keep_visible = self.config.get("keep_visible_fullscreen", False)
-            should_be_visible = is_taskbar_visible(taskbar_info) and (keep_visible or not is_taskbar_obstructed(taskbar_info, hwnd))
+            if free_float_active:
+                # The accessory display has no taskbar to hide behind, and the visibility/obstruction
+                # checks are judged against the (irrelevant) primary taskbar - so just keep it shown.
+                should_be_visible = True
+            else:
+                should_be_visible = is_taskbar_visible(taskbar_info) and (keep_visible or not is_taskbar_obstructed(taskbar_info, hwnd))
 
             if self.isVisible() != should_be_visible:
                 self.setVisible(should_be_visible)
-            
+
             # Only update position if we are supposed to be visible.
             if self.isVisible():
+                # Free-move keeps the user's exact saved spot (applied once); docked and free-float both
+                # reposition on the refresh (free-float re-places on / re-detects its taskbar-less display).
                 if not self.config.get("free_move", False):
-                    self.position_manager.update_position(fresh_taskbar_info=taskbar_info)
+                    # _float_refreshed=True: we already called refresh_float_state() above for the
+                    # visibility check this tick, so don't re-enumerate taskbars inside (#188).
+                    self.position_manager.update_position(fresh_taskbar_info=taskbar_info, _float_refreshed=True)
                 
                 # Always re-assert topmost status when visible to prevent falling behind taskbar (#77)
                 self._ensure_win32_topmost()
+
+                # One-time heads-up if we're sitting over the Win11 Widgets/weather panel (#200).
+                self._maybe_nudge_widgets_overlap(taskbar_info)
 
         except Exception as e:
             self.logger.error(f"Critical error in _execute_refresh (failure count: {self._taskbar_lost_count}): {e}")
@@ -755,9 +783,13 @@ class NetworkSpeedWidget(QWidget):
             # "keep visible over fullscreen" choice (issue #107). Without this guard
             # the immediate-hide path bypassed keep_visible_fullscreen, which
             # _execute_refresh() already respects, so the widget vanished anyway.
-            self.system_event_handler.immediate_hide_requested.connect(
-                lambda: None if self.config.get("keep_visible_fullscreen", False) else self.setVisible(False)
-            )
+            #
+            # Also skip the hide when free-floating (#188): a taskbar-less preferred
+            # monitor falls back to the *primary* taskbar for obstruction checks, so a
+            # fullscreen app on the primary would otherwise blink the off-taskbar widget
+            # out until the next refresh re-shows it. _execute_refresh() already forces
+            # it visible in this state; mirror that here so there's no transient flicker.
+            self.system_event_handler.immediate_hide_requested.connect(self._on_immediate_hide_requested)
 
             # Immediately re-assert topmost when the taskbar gains focus, so the widget
             # never lingers behind the activating taskbar (the debounced refresh is too
@@ -1362,12 +1394,12 @@ class NetworkSpeedWidget(QWidget):
     def _on_update_available(self, latest_version: str, release_url: str, body: str = "",
                              installer_url: str = "", portable_url: str = "") -> None:
         """Handle update available from automatic startup check."""
-        self._show_update_dialog(latest_version, release_url, body, installer_url)
+        self._show_update_dialog(latest_version, release_url, body, installer_url, portable_url)
 
     def _on_update_available_manual(self, latest_version: str, release_url: str, body: str = "",
                                     installer_url: str = "", portable_url: str = "") -> None:
         """Handle update available from manual menu check."""
-        self._show_update_dialog(latest_version, release_url, body, installer_url)
+        self._show_update_dialog(latest_version, release_url, body, installer_url, portable_url)
 
     def _on_up_to_date_manual(self) -> None:
         """Show up-to-date message for manual check."""
@@ -1381,7 +1413,7 @@ class NetworkSpeedWidget(QWidget):
         QMessageBox.warning(self, self.i18n.UPDATE_CHECK_TITLE, self.i18n.UPDATE_CHECK_FAILED_TEXT)
 
     def _show_update_dialog(self, latest_version: str, release_url: str, body: str = "",
-                            installer_url: str = "") -> None:
+                            installer_url: str = "", portable_url: str = "") -> None:
         """Show the update-available dialog: version delta + inert release notes,
         with Download / Skip / Not Now."""
         from netspeedtray.views.update_dialog import UpdateDialog
@@ -1390,25 +1422,35 @@ class NetworkSpeedWidget(QWidget):
         dlg.exec()
 
         if dlg.action == UpdateDialog.ACTION_DOWNLOAD:
-            self._start_secure_update(installer_url, release_url)
+            self._start_secure_update(installer_url, release_url,
+                                      portable_url=portable_url, latest_version=latest)
         elif dlg.action == UpdateDialog.ACTION_SKIP:
             self.config["skipped_version"] = latest
             self.update_config({"skipped_version": latest})
 
-    def _start_secure_update(self, installer_url: str, release_url: str) -> None:
+    def _start_secure_update(self, installer_url: str, release_url: str,
+                             *, portable_url: str = "", latest_version: str = "") -> None:
         """
         One-click update: download the signed installer, verify it (Authenticode +
         SignPath pin), and run it. Any failure falls back to opening the release page
         in the browser (the old behavior), so the worst case is never worse than before.
+
+        On the portable build (detected via the packaged marker file) the installer can't update the
+        unzipped folder in place, so this runs the guided portable flow instead: download + verify the
+        portable ZIP and stage it for the user to copy over (#195).
         """
         try:
             from netspeedtray.core.update_installer import SecureUpdater
+            from netspeedtray.utils.helpers import is_portable_install
             # In-flight guard: don't start a second download over a running one.
             existing = getattr(self, "_secure_updater", None)
             if existing is not None and existing.is_running():
                 return
+            portable = is_portable_install()
             # Parented to self (not GC'd); it self-destructs via deleteLater when done.
-            self._secure_updater = SecureUpdater(self, installer_url, release_url, self.i18n)
+            self._secure_updater = SecureUpdater(
+                self, installer_url, release_url, self.i18n,
+                portable=portable, portable_url=portable_url, latest_version=latest_version)
             self._secure_updater.launching.connect(self._quit_for_update)
             self._secure_updater.start()
         except Exception as e:
@@ -1484,6 +1526,36 @@ class NetworkSpeedWidget(QWidget):
             self.logger.error("Error showing location onboarding: %s", e, exc_info=True)
 
 
+    def _maybe_nudge_widgets_overlap(self, taskbar_info) -> None:
+        """One-time heads-up (#200): if the widget currently overlaps the Win11 Widgets/weather panel's
+        visible content, tell the user once that they can drag the widget wherever they like and it's
+        remembered. We deliberately never auto-move it - the panel's width changes with the weather, so
+        repositioning would make the widget jitter, and the user may want it right where it is. Fires at
+        most once, ever (session flag + persisted config flag)."""
+        try:
+            if self._widgets_nudge_shown or self.config.get("widgets_overlap_nudge_shown", False):
+                return
+            widgets_rect = getattr(taskbar_info, "widgets_rect", None)
+            if not widgets_rect:
+                return
+            from netspeedtray.utils.taskbar_utils import rect_overlaps_x
+            if not rect_overlaps_x(self.x(), self.x() + self.width(), widgets_rect,
+                                   getattr(taskbar_info, "dpi_scale", 1.0) or 1.0):
+                return
+            # Latch immediately so a re-entrant refresh (or the deferred call below) can't double-fire.
+            self._widgets_nudge_shown = True
+            self.update_config({"widgets_overlap_nudge_shown": True})
+            title = getattr(self.i18n, "WIDGETS_OVERLAP_NUDGE_TITLE", "NetSpeedTray overlaps the Widgets panel")
+            body = getattr(
+                self.i18n, "WIDGETS_OVERLAP_NUDGE_BODY",
+                "NetSpeedTray is sitting over the Windows Widgets/weather panel on your taskbar. You can "
+                "drag it anywhere you like - it'll remember the spot. (This message won't show again.)")
+            # Defer out of the refresh tick so the modal doesn't run inside the timer callstack.
+            QTimer.singleShot(0, lambda: QMessageBox.information(self, title, body))
+        except Exception as e:
+            self.logger.debug("widgets-overlap nudge check failed: %s", e)
+
+
     # update_config (redundant definition) removed
 
 
@@ -1526,6 +1598,13 @@ class NetworkSpeedWidget(QWidget):
         only drives the right-align decision and the live/preview parity.)
         """
         try:
+            # A free-floating widget on a taskbar-less display has no taskbar edge; render it as a
+            # compact horizontal readout (#188).
+            from netspeedtray.utils.taskbar_utils import get_free_float_screen
+            if self.config.get("free_float", True) and \
+                    get_free_float_screen(self.config.get("preferred_monitor")) is not None:
+                self._cached_layout_mode = 'horizontal'
+                return
             taskbar_info = get_taskbar_info()
             self._cached_layout_mode = self._layout_mode_for_edge(taskbar_info.get_edge_position())
         except Exception:
@@ -1676,11 +1755,18 @@ class NetworkSpeedWidget(QWidget):
                     pass
                 self.monitor_window = None
 
-            if self.config.get("free_move", False):
+            # Persist the widget's absolute spot when it's actively floating (Free Move or #188
+            # free-float). Only CLEAR the saved coords when the widget is genuinely docked - i.e. BOTH
+            # free_move and free_float are OFF in config. Crucially we do NOT clear just because the
+            # free-float display is currently absent (asleep/unplugged): is_floating() is runtime state,
+            # so gating the clear on it would wipe a user's dragged spot every time the accessory panel
+            # sleeps. (config_controller clears on an explicit switch to docked.) (#188)
+            if self.position_manager and self.position_manager.is_floating():
                 pos = self.pos()
                 self.update_config({"position_x": pos.x(), "position_y": pos.y()}, save_to_disk=False)
-            else:
+            elif not self.config.get("free_move", False) and not self.config.get("free_float", True):
                 self.update_config({"position_x": None, "position_y": None}, save_to_disk=False)
+            # else: free-float-capable but the display is temporarily absent -> keep the saved spot.
             
             self.logger.debug("Performing final configuration save...")
             self.config_manager.save(self.config)

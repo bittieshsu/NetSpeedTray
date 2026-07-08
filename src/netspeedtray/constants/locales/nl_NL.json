@@ -75,6 +75,7 @@
     "UPDATE_INTERVAL_LABEL": "Update-interval:",
     "START_WITH_WINDOWS_LABEL": "Starten met Windows",
     "FREE_MOVE_LABEL": "Vrij bewegen (geen uitlijning)",
+    "FREE_FLOAT_LABEL": "Float on a display without a taskbar",
     "KEEP_VISIBLE_FULLSCREEN_LABEL": "Zichtbaar houden in volledig scherm",
     "FONT_SIZE_LABEL": "Lettergrootte:",
     "FONT_FAMILY_LABEL": "Lettertype:",
@@ -213,6 +214,8 @@
     "UPDATE_AVAILABLE_TITLE": "Update beschikbaar",
     "UPDATE_DOWNLOADING_TITLE": "Update downloaden",
     "UPDATE_FALLBACK_MESSAGE": "Kan de in-app-update niet voltooien. De downloadpagina wordt in plaats daarvan geopend.",
+    "UPDATE_PORTABLE_READY_TITLE": "Update ready to install",
+    "UPDATE_PORTABLE_READY_MESSAGE": "NetSpeedTray {version} is ready in the folder that just opened:\n{ready}\n\nTo finish updating: close NetSpeedTray, then copy everything from that folder into your current folder:\n{app_dir}\n(replacing the old files). Your settings are kept.",
     "UPDATE_AVAILABLE_TEXT": "Een nieuwe versie van NetSpeedTray is beschikbaar!\n\nHuidig: v{current}\nNieuwste: v{latest}",
     "UPDATE_RELEASE_NOTES_LABEL": "Nieuw in v{latest}",
     "WELCOME_2_0_TITLE": "Welkom bij NetSpeedTray 2.0",
@@ -445,5 +448,7 @@
     "LOCATION_ONBOARDING_BODY": "NetSpeedTray can show the name of the Wi-Fi network you're on. Windows only reveals that name to apps that have <b>Location</b> access &mdash; so this is a Windows privacy setting, <b>not</b> GPS or tracking. NetSpeedTray reads the name locally to display it and never stores or sends it anywhere.<br><br>Turn on Location to show the network name, or keep just the band (2.4G&nbsp;/&nbsp;5G), which needs no permission.",
     "LOCATION_ONBOARDING_DONT_REMIND": "Don't remind me again",
     "LOCATION_ONBOARDING_OPEN_BUTTON": "Open Location settings",
-    "LOCATION_ONBOARDING_BAND_BUTTON": "Just show the band"
+    "LOCATION_ONBOARDING_BAND_BUTTON": "Just show the band",
+    "WIDGETS_OVERLAP_NUDGE_TITLE": "NetSpeedTray overlapt het Widgets-paneel",
+    "WIDGETS_OVERLAP_NUDGE_BODY": "NetSpeedTray staat over het Widgets-/weerpaneel van Windows op je taakbalk. Je kunt het overal naartoe slepen - de plek wordt onthouden. (Dit bericht verschijnt niet meer.)"
 }

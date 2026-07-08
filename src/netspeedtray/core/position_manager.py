@@ -292,12 +292,18 @@ class PositionCalculator:
         left_boundary = round(tasklist_rect[2] / dpi_scale) if tasklist_rect else full_geom.left()
 
         x = round(right_boundary - widget_width - offset)
-        
+
         # Safety check: don't overlap with app icons on left
         if x < left_boundary:
             logger.warning("Calculated position overlaps app icons; snapping to safe zone.")
             x = round(left_boundary + constants.layout.DEFAULT_PADDING)
-        
+
+        # NOTE: we deliberately do NOT auto-avoid the Win11 Widgets/weather element here. Its width
+        # changes with the weather text, so auto-repositioning would make the widget jitter left/right
+        # as the weather updates, and it would override a position the user chose. Instead the widget
+        # stays put and the user is nudged once that they can drag it (main.py, using widgets_rect). The
+        # user is always free to sit in the gap, or overlap it, or move it - their call (#200/#24).
+
         return x, y
 
     def _calculate_vertical_position(self, taskbar_info: TaskbarInfo, widget_size: Tuple[int, int],
@@ -380,6 +386,22 @@ class PositionCalculator:
         except Exception:
             return ScreenPosition(0, 0)
 
+    def calculate_free_float_default_position(self, screen: QScreen,
+                                              widget_size: Tuple[int, int]) -> ScreenPosition:
+        """Default position for a free-floating widget on a taskbar-less display (#188): bottom-right of
+        that screen's available geometry, inset by the edge margin. Mirrors `_get_safe_fallback_position`
+        but targets the given screen instead of primary."""
+        try:
+            screen_rect: QRect = screen.availableGeometry()
+            widget_width, widget_height = widget_size
+            ui_widget = getattr(constants.ui, 'widget', None)
+            margin_px = ui_widget.SCREEN_EDGE_MARGIN_PX if ui_widget else 10
+            x = screen_rect.right() - widget_width - margin_px
+            y = screen_rect.bottom() - widget_height - margin_px
+            return ScreenPosition(max(screen_rect.left(), x), max(screen_rect.top(), y))
+        except Exception:
+            return self._get_safe_fallback_position(widget_size)
+
     def constrain_drag_position(self, desired_pos: QPoint, taskbar_info: TaskbarInfo, widget_size_q: QSize) -> Optional[QPoint]:
         """Constrains a desired widget position during dragging to the 'safe zone'."""
         try:
@@ -448,6 +470,10 @@ class PositionManager(QObject):
         self._last_tray_rect: Optional[Tuple[int, int, int, int]] = None
         self._last_applied_geometry: Optional[QRect] = None
         self._taskbar_lost_count: int = 0
+        # Free-float (#188): set by refresh_float_state() when the preferred monitor is a taskbar-less
+        # display we should float on instead of docking to the primary taskbar.
+        self._free_float_active: bool = False
+        self._free_float_screen: Optional[QScreen] = None
         
         # Timers
         self._tray_watcher_timer = QTimer(self)
@@ -466,12 +492,39 @@ class PositionManager(QObject):
         self._tray_watcher_timer.stop()
         logger.debug("PositionManager monitoring stopped.")
 
+    def is_floating(self) -> bool:
+        """True when the widget should ignore taskbar docking - either the user's Free Move, or the
+        runtime free-float mode active when the preferred monitor has no taskbar of its own (#188)."""
+        return bool(self._state.config.get('free_move', False)) or self._free_float_active
+
+    def is_free_float_active(self) -> bool:
+        """True only when the runtime free-float mode is live (preferred monitor has no taskbar of its
+        own, #188). Unlike is_floating() this excludes plain Free Move, so callers that need to protect
+        the off-taskbar float specifically - e.g. not hiding it for a fullscreen app on another monitor -
+        don't also change docked Free-Move behavior."""
+        return self._free_float_active
+
+    def refresh_float_state(self) -> Optional[QScreen]:
+        """Re-evaluate whether the preferred monitor is a taskbar-less display to free-float on. Sets
+        `_free_float_active` / `_free_float_screen` and returns the target screen (or None). Cheap;
+        called each reposition. Honors the `free_float` opt-out."""
+        screen: Optional[QScreen] = None
+        if self._state.config.get('free_float', True):
+            preferred = self._state.config.get('preferred_monitor')
+            screen = taskbar_utils.get_free_float_screen(preferred)
+        self._free_float_screen = screen
+        self._free_float_active = screen is not None
+        return screen
+
     @pyqtSlot()
-    def update_position(self, fresh_taskbar_info: Optional[TaskbarInfo] = None) -> None:
+    def update_position(self, fresh_taskbar_info: Optional[TaskbarInfo] = None,
+                        _float_refreshed: bool = False) -> None:
         """
         Main entry point to update the widget's position.
         Uses fresh taskbar info if provided, otherwise fetches it - honoring
-        the `preferred_monitor` setting (#72) when present.
+        the `preferred_monitor` setting (#72) when present. `_float_refreshed` lets the ~1s refresh
+        loop (which already called refresh_float_state() for its visibility check) skip the duplicate
+        taskbar enumeration here (#188).
         """
         try:
             if fresh_taskbar_info:
@@ -480,7 +533,16 @@ class PositionManager(QObject):
                 preferred = self._state.config.get('preferred_monitor')
                 self._state.taskbar_info = get_taskbar_info(preferred_screen_name=preferred)
 
+            # #188: is the preferred monitor a taskbar-less display we should float on?
+            if not _float_refreshed:
+                self.refresh_float_state()
+
+            # A saved (dragged) position wins in both free-move and free-float.
             if self._apply_saved_position():
+                return
+
+            # No saved position + a taskbar-less preferred display -> default-place on that display.
+            if self._free_float_active and self._apply_free_float_position():
                 return
 
             if self._apply_calculated_position():
@@ -489,6 +551,23 @@ class PositionManager(QObject):
                 logger.warning("Failed to calculate position.")
         except Exception as e:
             logger.error("Error updating position: %s", e, exc_info=True)
+
+    def _apply_free_float_position(self) -> bool:
+        """Place the widget at a sensible default on the taskbar-less preferred display (#188). Returns
+        False (so the caller falls through to normal docking) if the target screen is gone or the widget
+        isn't laid out yet - a later reposition retries with valid dimensions."""
+        screen = self._free_float_screen
+        if screen is None:
+            return False
+        widget_width = self._state.widget.width()
+        widget_height = self._state.widget.height()
+        if widget_width <= 0 or widget_height <= 0:
+            return False
+        pos = self._calculator.calculate_free_float_default_position(screen, (widget_width, widget_height))
+        if pos is None:
+            return False
+        self._apply_geometry(pos.x, pos.y)
+        return True
 
     def _apply_saved_position(self) -> bool:
         """Applies saved position if 'free_move' is enabled.
@@ -499,7 +578,7 @@ class PositionManager(QObject):
         falls through to the calculated position so the widget appears near
         the tray instead of off-screen. Fixes #133.
         """
-        if not self._state.config.get('free_move', False):
+        if not self.is_floating():
             return False
 
         saved_x = self._state.config.get('position_x')
@@ -599,7 +678,7 @@ class PositionManager(QObject):
     @pyqtSlot()
     def _check_for_tray_changes(self) -> None:
         """Checks if the system tray geometry has changed (Stub for smart polling)."""
-        if self._state.config.get("free_move", False) or not self._state.widget.isVisible():
+        if self.is_floating() or not self._state.widget.isVisible():
             return
 
         try:
@@ -631,9 +710,9 @@ class PositionManager(QObject):
              preferred = self._state.config.get('preferred_monitor')
              self._state.taskbar_info = get_taskbar_info(preferred_screen_name=preferred)
 
-        # FIX for #87: specific check for Free Move
-        if self._state.config.get("free_move", False):
-            # If Free Move is enabled, only constrain to screen bounds (prevent total loss)
+        # FIX for #87: specific check for Free Move (and #188 free-float - both are "floating")
+        if self.is_floating():
+            # If floating, only constrain to screen bounds (prevent total loss)
             # FIX for #102: Use the screen at the drag destination, not the taskbar's screen
             # This allows the widget to be dragged freely across all connected monitors
             screen = QApplication.screenAt(pos)
@@ -666,53 +745,74 @@ class PositionManager(QObject):
         self.update_position()
         self.ensure_topmost()
 
-    def _ensure_taskbar_owner(self, hwnd: int) -> None:
+    def _ensure_taskbar_owner(self, hwnd: int) -> bool:
         """
         Dock the widget to the taskbar by making it an OWNED window of the taskbar
         (GWLP_HWNDPARENT). The window manager then keeps the widget above its owner
         at all times, so shell activity (Start menu, quick-settings, taskbar clicks)
         can no longer raise the taskbar over the widget and occlude it.
 
-        Re-applied on the topmost cadence because Qt can reset the owner across
+        Re-checked on the topmost cadence because Qt can reset the owner across
         show/flag changes, and the taskbar HWND changes on an explorer restart
-        (we re-own to the fresh handle automatically via _state.taskbar_info).
+        (we re-own to the fresh handle automatically via _state.taskbar_info). The
+        check is a cheap no-op once the owner is already correct, so in steady state
+        it never touches Z-order -- which is what keeps open shell menus undisturbed
+        (see the #200 note in ensure_topmost()).
+
+        Returns:
+            True iff the owner was just (re)established on this call.
         """
         try:
             tb_info = self._state.taskbar_info or get_taskbar_info()
             tb_hwnd = int(tb_info.hwnd) if tb_info and tb_info.hwnd else 0
             if not tb_hwnd or not win32gui.IsWindow(tb_hwnd):
-                return
+                return False
             if (_GetWindowLongPtr(hwnd, _GWLP_HWNDPARENT) or 0) != tb_hwnd:
                 _SetWindowLongPtr(hwnd, _GWLP_HWNDPARENT, tb_hwnd)
                 logger.debug("Widget docked to taskbar HWND %s (owner Z-order).", tb_hwnd)
+                return True
         except Exception as e:
             logger.error("Failed to set taskbar owner: %s", e)
+        return False
 
     def ensure_topmost(self) -> None:
         """
-        Re-assert the widget's Z-order.
+        Keep the widget docked above the taskbar -- WITHOUT re-inserting it at the top of
+        the topmost Z-band on every call.
 
-        Now that the widget is an OWNED window of the taskbar (_ensure_taskbar_owner),
-        the taskbar can never occlude it, so the old NOTOPMOST -> TOPMOST 're-promotion'
-        bounce is unnecessary. Its one-frame drop out of the topmost band was the
-        residual flicker seen on foreground changes. We keep only a single, flicker-free
-        HWND_TOPMOST assert as a light safety net above other (non-taskbar) topmost
-        windows -- re-asserting HWND_TOPMOST on an already-topmost window does not remove
-        it from the band, so there is no drop.
+        The widget is an OWNED window of the taskbar (_ensure_taskbar_owner). That owner
+        relationship alone keeps it above the taskbar through all shell activity (Start
+        menu, taskbar clicks, the taskbar being explicitly raised) -- an owned window is
+        always kept above its owner. So no periodic HWND_TOPMOST re-assert is needed to
+        stop the taskbar occluding the widget.
+
+        Why the old re-assert was actively harmful (#200): the previous code called
+        SetWindowPos(HWND_TOPMOST) here on every foreground change and on a ~1 Hz timer.
+        Because the widget is owned by the taskbar, each assert dragged the taskbar's whole
+        owner-cluster back up to the top of the topmost band -- ABOVE any classic shell
+        menu/flyout that happened to be open (taskbar right-click "Close", "Safely remove
+        hardware", jump lists, ...). That clipped exactly the menu rows overlapping the
+        taskbar strip. Measured with a genuine #32768 menu: with the periodic assert the
+        taskbar sat above the open menu in 23/23 samples; without it, 0/23.
+
+        We therefore assert HWND_TOPMOST only ONCE, at the moment we (re)establish the
+        owner -- first dock at startup and after an explorer restart -- when no such menu
+        can be up. In steady state this method only re-verifies the (unchanged) owner and
+        reorders nothing.
         """
         try:
             hwnd = int(self._state.widget.winId())
             if not win32gui.IsWindow(hwnd):
                 return
 
-            # Dock the widget to the taskbar (owned window): keeps it above the taskbar.
-            self._ensure_taskbar_owner(hwnd)
-
-            # Single, flicker-free topmost assert (no NOTOPMOST drop).
-            win32gui.SetWindowPos(
-                hwnd, win32con.HWND_TOPMOST, 0, 0, 0, 0,
-                win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | win32con.SWP_NOACTIVATE
-            )
+            # Dock (or re-dock) to the taskbar. Only reorders Z when the owner is actually
+            # (re)established; a single topmost assert then seats it in the band. This
+            # never runs in steady state, so open shell menus are left alone (#200).
+            if self._ensure_taskbar_owner(hwnd):
+                win32gui.SetWindowPos(
+                    hwnd, win32con.HWND_TOPMOST, 0, 0, 0, 0,
+                    win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | win32con.SWP_NOACTIVATE
+                )
         except Exception as e:
             logger.error("Failed to ensure topmost status: %s", e)
 

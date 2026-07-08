@@ -75,6 +75,7 @@
     "UPDATE_INTERVAL_LABEL": "Intervalo de actualización:",
     "START_WITH_WINDOWS_LABEL": "Iniciar con Windows",
     "FREE_MOVE_LABEL": "Movimiento Libre (sin ajuste)",
+    "FREE_FLOAT_LABEL": "Float on a display without a taskbar",
     "KEEP_VISIBLE_FULLSCREEN_LABEL": "Mantener visible en pantalla completa",
     "FONT_SIZE_LABEL": "Tamaño de fuente:",
     "FONT_FAMILY_LABEL": "Fuente:",
@@ -213,6 +214,8 @@
     "UPDATE_AVAILABLE_TITLE": "Actualización disponible",
     "UPDATE_DOWNLOADING_TITLE": "Descargando actualización",
     "UPDATE_FALLBACK_MESSAGE": "No se pudo completar la actualización en la aplicación. Se abrirá la página de descarga en su lugar.",
+    "UPDATE_PORTABLE_READY_TITLE": "Update ready to install",
+    "UPDATE_PORTABLE_READY_MESSAGE": "NetSpeedTray {version} is ready in the folder that just opened:\n{ready}\n\nTo finish updating: close NetSpeedTray, then copy everything from that folder into your current folder:\n{app_dir}\n(replacing the old files). Your settings are kept.",
     "UPDATE_AVAILABLE_TEXT": "¡Una nueva versión de NetSpeedTray está disponible!\n\nActual: v{current}\nÚltima: v{latest}",
     "UPDATE_RELEASE_NOTES_LABEL": "Novedades en v{latest}",
     "WELCOME_2_0_TITLE": "Te damos la bienvenida a NetSpeedTray 2.0",
@@ -445,5 +448,7 @@
     "LOCATION_ONBOARDING_BODY": "NetSpeedTray can show the name of the Wi-Fi network you're on. Windows only reveals that name to apps that have <b>Location</b> access &mdash; so this is a Windows privacy setting, <b>not</b> GPS or tracking. NetSpeedTray reads the name locally to display it and never stores or sends it anywhere.<br><br>Turn on Location to show the network name, or keep just the band (2.4G&nbsp;/&nbsp;5G), which needs no permission.",
     "LOCATION_ONBOARDING_DONT_REMIND": "Don't remind me again",
     "LOCATION_ONBOARDING_OPEN_BUTTON": "Open Location settings",
-    "LOCATION_ONBOARDING_BAND_BUTTON": "Just show the band"
+    "LOCATION_ONBOARDING_BAND_BUTTON": "Just show the band",
+    "WIDGETS_OVERLAP_NUDGE_TITLE": "NetSpeedTray se superpone al panel de widgets",
+    "WIDGETS_OVERLAP_NUDGE_BODY": "NetSpeedTray está encima del panel de widgets o de El tiempo de Windows en la barra de tareas. Puedes arrastrarlo a donde quieras y recordará la posición. (Este mensaje no volverá a aparecer.)"
 }
