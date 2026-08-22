@@ -62,7 +62,7 @@ def download_to(url: str, dest: str,
         read = 0
         while True:
             if is_cancelled is not None and is_cancelled():
-                raise RuntimeError("cancelled")
+                raise RuntimeError("canceled")
             chunk = resp.read(_CHUNK)
             if not chunk:
                 break
@@ -229,7 +229,7 @@ class _DownloadWorker(QObject):
             self.failed.emit(str(e))
             return
         if self._cancelled:
-            self.failed.emit("cancelled")
+            self.failed.emit("canceled")
             return
         try:
             if self._portable:
@@ -253,11 +253,14 @@ class _DownloadWorker(QObject):
             raise RuntimeError("no published checksum for the portable build")
         actual = _sha256_file(self._dest)
         if actual != expected:
+            logger.warning("Portable update checksum MISMATCH for %s", self._expected_name)
             raise RuntimeError("checksum mismatch - the download may be corrupt or tampered")
+        logger.info("Portable update checksum verified for %s", self._expected_name)
         _safe_extract(self._dest, self._extract_dir or "")
         app_folder = os.path.dirname(_locate_portable_exe(self._extract_dir or ""))
         ready = _unique_dir(self._ready_target)
         shutil.move(app_folder, ready)   # move the verified tree out of the temp dir, off the UI thread
+        logger.info("Portable update staged; the user must copy this folder over their install.")
         self.staged.emit(ready)
 
 
@@ -317,6 +320,8 @@ class SecureUpdater(QObject):
             return
 
         self._active = True
+        logger.info("Update starting: mode=%s version=%s", "portable" if self._portable else "installer",
+                    self._latest_version or "?")
         title = getattr(self.i18n, "UPDATE_DOWNLOADING_TITLE", "Downloading update")
         cancel = getattr(self.i18n, "CANCEL_BUTTON", "Cancel")
         self._progress = QProgressDialog(title, cancel, 0, 100, self._parent)
@@ -430,7 +435,7 @@ class SecureUpdater(QObject):
         self._teardown_thread()
         self._close_progress()
         self._cleanup_file()
-        if reason == "cancelled":
+        if reason == "canceled":
             self._finish()
             return
         self._fallback(reason)
