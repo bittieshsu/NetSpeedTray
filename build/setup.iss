@@ -11,7 +11,21 @@
 ; If AppVersion is NOT defined (e.g., manual compile without build.bat), use a default.
 ; When running via build.bat, the /DAppVersion="x.x.x" flag overrides this.
 #ifndef AppVersion
-  #define AppVersion "0.0.0" 
+  #define AppVersion "0.0.0"
+#endif
+
+; VersionInfoVersion only accepts dot-separated integers, so a prerelease AppVersion like
+; "2.2.0-beta.1" aborts the compile ("Value of [Setup] section directive VersionInfoVersion is
+; invalid"). build.bat passes /DAppVersionNumeric with the numeric quad derived by
+; create_version_info.py --numeric ("2.2.0-beta.1" -> "2.2.0.1"); AppVersion keeps the display
+; string for filenames and the free-text version fields. On a manual compile without the define,
+; fall back to AppVersion itself when it is numeric-only, else to a recognisable placeholder.
+#ifndef AppVersionNumeric
+  #if Pos("-", AppVersion) == 0
+    #define AppVersionNumeric AppVersion
+  #else
+    #define AppVersionNumeric "0.0.0.0"
+  #endif
 #endif
 
 [Setup]
@@ -36,7 +50,11 @@ SolidCompression=yes
 OutputDir=installer
 
 OutputBaseFilename=NetSpeedTray-{#AppVersion}-x64-Setup
-VersionInfoVersion={#AppVersion}
+VersionInfoVersion={#AppVersionNumeric}
+; Free-text version fields carry the full display string, so a beta installer is identifiable
+; as a beta in Properties > Details even though the numeric quad above cannot say so.
+VersionInfoTextVersion={#AppVersion}
+VersionInfoProductTextVersion={#AppVersion}
 
 DisableDirPage=auto
 UsePreviousAppDir=no
@@ -82,6 +100,11 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: 
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#MyAppName}}"; Flags: nowait postinstall skipifsilent
+; A silent install (Microsoft Store, winget install, winget upgrade) shows no Finish page, so the
+; entry above never fires and the app is simply not running until the next sign-in - "nothing
+; visible happened" (#260) on a new channel. This entry covers the silent path only, and
+; runasoriginaluser keeps the tray app unelevated even though Setup itself ran as admin.
+Filename: "{app}\{#MyAppExeName}"; Flags: nowait runasoriginaluser; Check: LaunchAfterSilentInstall
 
 [UninstallDelete]
 Type: files; Name: "{autodesktop}\{#MyAppName}.lnk"
@@ -103,6 +126,13 @@ const
   WM_CLOSE = $0010;  
 
 // --- Helper Functions ---
+function LaunchAfterSilentInstall(): Boolean;
+begin
+  Result := WizardSilent();
+  if Result then
+    Log('Silent install: starting {#MyAppName} as the original user (no Finish page to offer it).');
+end;
+
 function BoolToStr(Value: Boolean): string;
 begin
   if Value then
@@ -225,11 +255,14 @@ function InitializeSetup(): Boolean;
 begin
   if IsAppRunning() then
   begin
-    if MsgBox('{#MyAppName} is currently running and needs to be closed to continue installation.'#13#10#13#10'Click OK to automatically close it, or Cancel to exit the installer.', mbConfirmation, MB_OKCANCEL) = IDOK then
+    // SuppressibleMsgBox, not MsgBox: a plain MsgBox is NOT suppressed by /SUPPRESSMSGBOXES, so a
+    // silent install (Microsoft Store, winget upgrade) over a running app hung on this dialog.
+    // Silent default = OK = close the app and carry on, which is what an upgrade must do.
+    if SuppressibleMsgBox('{#MyAppName} is currently running and needs to be closed to continue installation.'#13#10#13#10'Click OK to automatically close it, or Cancel to exit the installer.', mbConfirmation, MB_OKCANCEL, IDOK) = IDOK then
     begin
       if not CloseNetSpeedTray() then
       begin
-        MsgBox('Failed to close {#MyAppName}.'#13#10'Please close it manually and try again.', mbError, MB_OK);
+        SuppressibleMsgBox('Failed to close {#MyAppName}.'#13#10'Please close it manually and try again.', mbError, MB_OK, IDOK);
         Result := False;
         Exit;
       end;
@@ -247,11 +280,11 @@ function InitializeUninstall(): Boolean;
 begin
   if IsAppRunning() then
   begin
-    if MsgBox('{#MyAppName} is currently running and needs to be closed to continue uninstallation.'#13#10#13#10'Click OK to automatically close it, or Cancel to exit the uninstaller.', mbConfirmation, MB_OKCANCEL) = IDOK then
+    if SuppressibleMsgBox('{#MyAppName} is currently running and needs to be closed to continue uninstallation.'#13#10#13#10'Click OK to automatically close it, or Cancel to exit the uninstaller.', mbConfirmation, MB_OKCANCEL, IDOK) = IDOK then
     begin
       if not CloseNetSpeedTray() then
       begin
-        MsgBox('Failed to close {#MyAppName}.'#13#10'Please close it manually and try again.', mbError, MB_OK);
+        SuppressibleMsgBox('Failed to close {#MyAppName}.'#13#10'Please close it manually and try again.', mbError, MB_OK, IDOK);
         Result := False;
         Exit;
       end;
