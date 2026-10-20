@@ -247,8 +247,13 @@ closed-app window that spans the reset day counts toward the period it started i
 
 `key`/`value` text pairs: `db_version` (8), `created_at`, the four tier watermarks above,
 `current_retention_days`, `last_maintenance_at`, the pending-retention keys used to schedule a prune,
-and `pending_history_compaction` while a "Delete all history" still owes a WAL checkpoint. Every key a
-2.1 database had is carried over unchanged by the upgrade.
+and `pending_history_compaction` while a "Delete all history" still owes a WAL checkpoint (`1`) or a
+checkpoint plus removing a backup that was locked (`2` - only a `2` ever deletes a backup at startup;
+2.1.x writes `1`, and the upgrade carries it over). `migrated_from_v7_at` / `migrated_from_v7_backup`
+record a completed v7 -> v8 upgrade and the backup it left; `backup_clock_continuous_since` arms
+backup age-out (see [Restoring a backup](#restoring-a-backup)). `usage_counter_snapshot` holds the NIC counters,
+by adapter name, that `usage_counter`'s total was counted up to (same-boot launch reconciliation).
+Every key a 2.1 database had is carried over unchanged by the upgrade.
 
 `usage_counter_snapshot` is JSON, written in the same transaction as the `usage_counter` row:
 `{"v": 1, "boot_time": <psutil.boot_time()>, "ts": <epoch s the counters were read>,
@@ -418,8 +423,8 @@ swapped in by two renames; the 2.1 file is kept, unchanged, as the backup (below
 v7 is first brought to v7 in place, with a verified backup, as 2.1 did. If the upgrade cannot finish
 - not enough free disk (it needs 1.5× the file), another program holding the file, a check that does
 not match - nothing is changed: NetSpeedTray shows your history read-only, records nothing, says so,
-and tries again at the next start. A kill at any moment (the installer force-closes the app) is
-finished or undone at the next start from `migrate_v8.journal`. What the upgrade carries over and
+and tries again at the next start. A kill at any moment (a crash, Task Manager, or the installer
+force-closing an app that didn't close when asked) is finished or undone at the next start from `migrate_v8.journal`. What the upgrade carries over and
 what it cannot:
 
 - the last 24 hours of per-second rows become per-minute rows (2.1 never stored bytes or intervals,
@@ -446,6 +451,48 @@ The upgrade to v8 keeps your 2.1 database, unchanged, next to the new one:
 v7) write a verified copy with the same naming. NetSpeedTray keeps the newest two backups plus the
 newest one of every schema version, so the v7 backup is never pushed out by later ones.
 
+A backup holds history too, so it follows the same rules as the live file:
+
+- **Only the app's own names.** Matched exactly (ignoring case, as NTFS does), each with an optional `-wal` /
+  `-shm` / `-journal` suffix: `speed_history.db.bak.v<N>_<YYYYMMDD>_<HHMMSS>[_<n>]`, the legacy bare
+  `speed_history.db.bak`, and `speed_history.db.stray_<YYYYMMDD>_<HHMMSS>[_<n>]`. Nothing else in the
+  folder is ever deleted or written, and a directory never is. The same matcher decides what the
+  older-version upgrades prune and which file the downgrade notice names as the one to restore.
+- **It ages out with "Keep history for".** The hourly maintenance deletes a backup once it is older
+  than the retention period, but never sooner than 30 days after it was made (`BACKUP_MIN_KEEP_DAYS`),
+  so a rollback to 2.1.x always has a month. "Keep everything" keeps backups forever. Its age comes
+  from the LATER of the date in its name and the file's modified time, and a file dated in the future
+  is kept. Three guards, because a wrong deletion cannot be undone:
+  - **The 30 days are counted in time the app observed.** Each maintenance pass credits at most 2 h
+    (`BACKUP_STEADY_CREDIT_MAX_SEC`) of steady time to every backup present (`backup_seen_s:<name>` in
+    `metadata`); app-off time and clock jumps add nothing. A backup goes only when BOTH its dates say
+    it is older than the retention AND it has been observed for 30 days - so a clock corrected forward,
+    or a jump small enough to pass for app-off time, can never shorten the floor.
+  - **The clock must look right.** Age-out only runs once every maintenance pass for the last 7 days
+    followed the previous one within 14 days, in order (`backup_clock_continuous_since` in
+    `metadata`; `BACKUP_CLOCK_*`). Within a session the wall clock is also checked against the
+    monotonic clock between passes: a disagreement over 5 minutes (or 1%) is a jump too. A clock set to 2030 would otherwise make a day-old backup look
+    years old - on the same pass that prunes the live rows, leaving no copy at all.
+  - **A pre-v8 file needs a finished upgrade.** A `.bak.v<N>` with N < 8, the bare `.bak` and a
+    stray are only aged out when the live file records a completed v7 -> v8 migration
+    (`migrated_from_v7_at`, written on success; files migrated by 2.2.0-beta.1 do not have it, so
+    their backup is kept until "Delete all history"). A fresh v8 file next to a v7 backup - an upgrade
+    whose journal was deleted by hand - means that backup is the only full history.
+- **"Delete all history" deletes every backup**, `-wal`/`-shm` sidecars included (each file is
+  overwritten with zeros first), so after a delete there is nothing to restore. The same goes for
+  `speed_history.db.stray_<date>` files - whatever an interrupted upgrade's recovery found under the
+  live name and moved aside rather than delete (it can be a whole 2.1-recorded history file); they
+  also age out by the rule above. A symbolic link, junction or hard-linked file with one of these
+  names is only unlinked - whatever it points at is never written; if such a link is read-only it
+  cannot be unlinked without changing the file it shares, so it is left in place for good
+  (`backups_unremovable` in `metadata`, never retried) and the result says so. A read-only file that
+  is not linked is made writable first. A backup another program holds open is retried with backoff (5 s doubling to 1 h, at most 8
+  times a session, logged once as a warning) without being re-zeroed, while the WAL checkpoint is
+  retried on its own; whatever is still left goes at the next start. Nothing is removed while
+  `migrate_v8.journal` exists - an unfinished upgrade still needs its backup; the result says it is
+  kept until the upgrade has finished, and it is removed at a later start. A failure while handing
+  the free pages back AFTER the delete has committed is still a done delete (retried while idle).
+
 You need it if you go back to NetSpeedTray 2.1.x after 2.2 upgraded your database. (Going back
 without restoring is safe too - see the next section - it just doesn't record.) **With NetSpeedTray
 fully closed**, in `%APPDATA%\NetSpeedTray`:
@@ -464,8 +511,10 @@ fully closed**, in `%APPDATA%\NetSpeedTray`:
 write-ahead log of the database you are replacing. Leave them behind and SQLite silently replays
 them into the restored file on the next launch — the result *passes* an integrity check but has the
 wrong schema inside, and the history in it is unrecoverable. Don't be reassured by their absence
-either: a clean shutdown removes them, but a force-killed app (which is exactly what the installer
-does during an upgrade) leaves them hot.
+either: a clean shutdown removes them, but a force-killed app leaves them hot. The installer asks
+the app to close cleanly and only force-closes it if that fails - but installing 2.1.x over 2.2
+always force-closes it, because 2.1.x installers can't send that request (and upgrading *from*
+2.1.7 force-closes 2.1.7 once, for the same reason).
 
 Copying in step 2, rather than renaming the `.bak` itself, keeps the backup intact in case anything
 goes wrong. The restored file holds your history **up to the moment of the upgrade**; anything 2.2
@@ -483,7 +532,8 @@ error every 10 seconds (they try to write into the read-only views), and their d
 writes go into the v8 file.
 
 **A 2.1.x launch can change the v8 file's bytes without writing to it.** If 2.2 was killed rather
-than closed (Task Manager, a crash, the installer during an upgrade), its last writes are still in
+than closed (Task Manager, a crash, or an installer force-closing it - which a 2.1.x installer
+always does), its last writes are still in
 `speed_history.db-wal`. The first 2.1.x to open the file checkpoints those frames - 2.2's own data -
 into `speed_history.db`. The file's hash and timestamp change, but it is still v8, passes
 `PRAGMA integrity_check`, and holds nothing written by 2.1.x. Harmless; it only matters if you are
@@ -527,8 +577,15 @@ are identifying) - with `secure_delete` on, so the freed pages are overwritten w
 free space back, and runs `wal_checkpoint(TRUNCATE)` so the old pages are gone from
 `speed_history.db-wal` too. If a reader is mid-query (the Monitor's graphs) the checkpoint reports
 busy; the app then says the file is still being cleaned up and retries every few seconds while idle
-until it completes. `metadata` is kept, and so is `usage_counter` unless you tick "Also reset this
-period's data usage" in the confirmation. Recording carries on into the emptied tables.
+until it completes. Every backup and moved-aside file - `speed_history.db.bak.v<N>_<YYYYMMDD>_<HHMMSS>[_<n>]`,
+the bare `speed_history.db.bak` and `speed_history.db.stray_<YYYYMMDD>_<HHMMSS>[_<n>]`, each with its
+`-wal`/`-shm`/`-journal` - is then removed (see
+[Restoring a backup](#restoring-a-backup)). `metadata` is kept, and so is `usage_counter` unless you
+tick "Also reset this period's data usage" in the confirmation - which, in the same transaction,
+also deletes `usage_counter_snapshot`, so the next launch reconciles nothing from before the reset.
+The app resets its in-memory counter (and re-arms the data-cap alerts) only once the delete has
+reported success; a failed delete leaves the counter exactly as it was. Recording carries on into
+the emptied tables.
 
 ---
 
@@ -542,7 +599,8 @@ NetSpeedTray does not record what it cannot measure honestly:
 - **Which traffic was LAN and which was internet.** Adapter byte counters carry no addresses, ports
   or routes — the information simply is not there to filter on.
 - **Wi-Fi network names, MAC addresses, IP addresses.** Adapter friendly names are the only
-  identifying text in the file, and "Delete all history" removes them.
+  identifying text in the file (in `interfaces`, and in `usage_counter_snapshot`), and "Delete all
+  history" removes them - the snapshot's copy only when you also reset the data-usage counter.
 - **Anything that leaves your machine.** No telemetry, no accounts, no uploads. The latency probe
   pings your own gateway by default (about 1.3 small packets a second); pinging a public host is
   opt-in and you name the host.
