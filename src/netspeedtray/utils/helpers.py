@@ -96,6 +96,37 @@ def has_dedicated_vram(used: Optional[float]) -> bool:
         return False
 
 
+def hardware_in_hover_card_active(config) -> bool:
+    """The "Show hardware in the hover card" switch is on AND there is hardware to move there.
+
+    RAM rides on the CPU line and VRAM on the GPU line (they are only collected and shown with
+    their host monitor), so "some hardware is enabled" means CPU or GPU monitoring is on. With
+    nothing enabled the switch is inert: the widget keeps its Display Mode and the card gets no
+    hardware section."""
+    try:
+        return bool(config.get("hardware_in_hover_card", False)) and bool(
+            config.get("monitor_cpu_enabled", False) or config.get("monitor_gpu_enabled", False))
+    except AttributeError:
+        return False
+
+
+def effective_display_mode(config) -> str:
+    """The display mode the taskbar widget actually SIZES and PAINTS with.
+
+    The one place the hover-card switch touches the widget: while it is active
+    (``hardware_in_hover_card_active``) every Display Mode collapses to ``network_only`` - the
+    clean network readout + mini graph (split graphs included) - and the hardware moves to the
+    hover card. The user's ``widget_display_mode`` is left alone on disk, so turning the switch
+    off brings their layout back unchanged. RenderConfig (paint, Settings preview), the layout
+    manager (sizing) and the Auto-Cycle timer all read the mode through here, so they can't
+    disagree."""
+    try:
+        mode = str(config.get("widget_display_mode", "network_only") or "network_only")
+    except AttributeError:
+        return "network_only"
+    return "network_only" if hardware_in_hover_card_active(config) else mode
+
+
 def is_portable_install() -> bool:
     """
     True when the app is running as the portable ZIP build.
@@ -615,5 +646,25 @@ def calculate_monotone_cubic_interpolation(x_coords: List[float], y_coords: List
     
     interp_x.append(x[-1])
     interp_y.append(y[-1])
-    
+
     return interp_x, interp_y
+
+
+def reveal_in_explorer(path: str) -> None:
+    """Open File Explorer on the folder holding ``path``, with the file selected. Never raises.
+
+    Explorer is launched by ABSOLUTE path (it lives in the Windows dir, not System32). A bare
+    "explorer" lets CreateProcess search the current directory first, and the portable build chdir's
+    into its own - user/attacker-writable - folder, so a planted explorer.exe could run. Same
+    CWD-hijack hardening the codebase already applies to nvidia-smi (monitor_thread.py).
+
+    The command line is built by hand: Explorer splits /select, on commas, and list2cmdline quotes
+    only paths with spaces, so a path like ``C:\\a,b\\x.zip`` would open the wrong place. The path is
+    always quoted (a Windows path cannot contain '"'; any is stripped)."""
+    try:
+        import subprocess
+        explorer = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "explorer.exe")
+        target = os.path.normpath(str(path)).replace('"', "")
+        subprocess.Popen(f'"{explorer}" /select,"{target}"')
+    except Exception as e:
+        logging.getLogger("NetSpeedTray.helpers").debug("reveal_in_explorer failed: %s", e)

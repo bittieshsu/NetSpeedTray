@@ -77,6 +77,11 @@ class ConfigConstants:
     # widget changes size on upgrade. Side by side on a horizontal taskbar, stacked on a vertical one;
     # Auto-Cycle rotates upload and download as their own phases instead, so it keeps its size.
     DEFAULT_GRAPH_SPLIT_DIRECTIONS: Final[bool] = False
+    # Mini graph look: "detailed" plots every sample (the classic filled, spiky graph); "trend" smooths
+    # each series into a calm line (widget_renderer.trend_smooth). Trend is the default (owner, #395),
+    # also for existing configs without the key; Detailed is one click away in Settings.
+    GRAPH_STYLE_CHOICES: Final[List[str]] = ["detailed", "trend"]
+    DEFAULT_GRAPH_STYLE: Final[str] = "trend"
     DEFAULT_INTERFACE_MODE: Final[str] = network.interface.DEFAULT_MODE
     DEFAULT_KEEP_DATA_DAYS: Final[int] = data.retention.DEFAULT_DAYS # 365 days (1 Year) default
     DEFAULT_DARK_MODE: Final[bool] = True
@@ -139,6 +144,9 @@ class ConfigConstants:
     DEFAULT_SHOW_HARDWARE_TEMPS: Final[bool] = True
     DEFAULT_SHOW_HARDWARE_POWER: Final[bool] = False
     DEFAULT_STACK_HARDWARE_STATS: Final[bool] = True
+    # Side-taskbar design phase C: keep the taskbar widget to network speed and show the enabled
+    # CPU/GPU/memory in the hover card instead. Off by default, so nobody's widget changes.
+    DEFAULT_HARDWARE_IN_HOVER_CARD: Final[bool] = False
     # CPU/GPU label SHAPE and COLOUR are two settings (2.2): the style is "icons" | "text", the
     # colour "brand" | "match_text" | "custom". The pre-2.2 three-way style (icons_colored /
     # icons_monochrome / text) is split in two by ConfigManager._migrate_config.
@@ -184,6 +192,7 @@ class ConfigConstants:
         "graph_scale_headroom": DEFAULT_GRAPH_SCALE_HEADROOM,
         "graph_show_ceiling": DEFAULT_GRAPH_SHOW_CEILING,
         "graph_split_directions": DEFAULT_GRAPH_SPLIT_DIRECTIONS,
+        "graph_style": DEFAULT_GRAPH_STYLE,
         "interface_mode": DEFAULT_INTERFACE_MODE,
         "selected_interfaces": [],
         "excluded_interfaces": network.interface.DEFAULT_EXCLUSIONS,
@@ -275,6 +284,7 @@ class ConfigConstants:
         "plan_up_mbps": 0,
         "throttle_temp_c": 0,
         "stack_hardware_stats": DEFAULT_STACK_HARDWARE_STATS,
+        "hardware_in_hover_card": DEFAULT_HARDWARE_IN_HOVER_CARD,
         "widget_display_mode": DEFAULT_WIDGET_DISPLAY_MODE,
         "widget_display_order": DEFAULT_WIDGET_DISPLAY_ORDER,
         "widget_cycle_interval": DEFAULT_WIDGET_CYCLE_INTERVAL,
@@ -337,6 +347,7 @@ class ConfigConstants:
         "graph_scale_headroom": {"type": int, "default": DEFAULT_GRAPH_SCALE_HEADROOM, "choices": GRAPH_SCALE_HEADROOM_CHOICES},
         "graph_show_ceiling": {"type": bool, "default": DEFAULT_GRAPH_SHOW_CEILING},
         "graph_split_directions": {"type": bool, "default": DEFAULT_GRAPH_SPLIT_DIRECTIONS},
+        "graph_style": {"type": str, "default": DEFAULT_GRAPH_STYLE, "choices": GRAPH_STYLE_CHOICES},
         "interface_mode": {"type": str, "default": DEFAULT_INTERFACE_MODE, "choices": list(network.interface.VALID_INTERFACE_MODES)},
         "selected_interfaces": {"type": list, "default": [], "item_type": str},
         "excluded_interfaces": {"type": list, "default": network.interface.DEFAULT_EXCLUSIONS, "item_type": str},
@@ -423,6 +434,7 @@ class ConfigConstants:
         "throttle_temp_c": {"type": (int, float), "default": 0, "min": 0, "max": 130},
         "show_hardware_power": {"type": bool, "default": DEFAULT_SHOW_HARDWARE_POWER},
         "stack_hardware_stats": {"type": bool, "default": DEFAULT_STACK_HARDWARE_STATS},
+        "hardware_in_hover_card": {"type": bool, "default": DEFAULT_HARDWARE_IN_HOVER_CARD},
         "widget_display_mode": {"type": str, "default": DEFAULT_WIDGET_DISPLAY_MODE, "choices": ["network_only", "cycle", "side_by_side"]},
         "widget_display_order": {"type": list, "default": DEFAULT_WIDGET_DISPLAY_ORDER, "item_type": str},
         "widget_cycle_interval": {"type": int, "default": DEFAULT_WIDGET_CYCLE_INTERVAL, "min": 1, "max": 60},

@@ -31,7 +31,7 @@ from netspeedtray import constants
 from netspeedtray.utils import styles as style_utils
 from netspeedtray.utils.window_state import (restore_window_position, save_window_position,
                                              set_window_always_on_top)
-from netspeedtray.utils.helpers import get_app_data_path, get_app_asset_path
+from netspeedtray.utils.helpers import get_app_data_path, get_app_asset_path, reveal_in_explorer
 from netspeedtray.utils.styles import is_dark_mode
 from netspeedtray.utils.support_bundle import build_support_bundle
 from netspeedtray.utils.dwm import apply_win11_chrome
@@ -516,11 +516,24 @@ class SettingsDialog(QDialog):
         try:
             # Preview parity on a side (LEFT/RIGHT) taskbar: as wide as the bar, laid out as there.
             pv.set_bar_width(self._docked_side_bar_width())
-            pv.set_config({**self.config, **(settings or {})})
-            self.widget_page.set_side_bar_note_visible(
-                bool(pv.side_fit is not None and pv.side_fit.hides_hardware))
+            merged = {**self.config, **(settings or {})}
+            pv.set_config(merged)
+            self.widget_page.set_display_mode_note(self._display_mode_note_kind(merged, pv.side_fit))
         except Exception as e:
             self.logger.debug("preview update failed: %s", e)
+
+    @staticmethod
+    def _display_mode_note_kind(settings: Dict[str, Any], side_fit) -> Optional[str]:
+        """Which note goes under Widget > Display Mode (WidgetPage.set_display_mode_note). The
+        hover-card switch wins on every edge - it is the reason the bar shows network only, and the
+        more specific explanation on a side bar too; else the side-bar note when a docked side bar
+        has no room for the hardware; else none."""
+        from netspeedtray.utils.helpers import hardware_in_hover_card_active
+        if hardware_in_hover_card_active(settings):
+            return "hover_card"
+        if side_fit is not None and side_fit.hides_hardware:
+            return "side_bar"
+        return None
 
     def _docked_side_bar_width(self) -> Optional[int]:
         """The live widget's width when it is docked to a side taskbar (it is exactly the bar's
@@ -609,7 +622,7 @@ class SettingsDialog(QDialog):
                 self,
                 self.i18n.EXPORT_SUPPORT_BUNDLE_TITLE,
                 default_path,
-                "Zip files (*.zip);;All Files (*)",
+                f"{self.i18n.STATS_DETAIL_EXPORT_ZIP_LABEL} (*.zip)",   # shared with the stats export
             )
 
             if not dest_path:
@@ -620,11 +633,15 @@ class SettingsDialog(QDialog):
                 config=self.config,
             )
             self.logger.info("Support bundle written to %s", written)
-            QMessageBox.information(
-                self,
-                self.i18n.SUCCESS_TITLE,
-                self.i18n.SUPPORT_BUNDLE_SUCCESS_MESSAGE.format(file_path=str(written)),
-            )
+            # The next step is attaching the zip to an issue, so offer to show it in Explorer.
+            box = QMessageBox(QMessageBox.Icon.Information, self.i18n.SUCCESS_TITLE,
+                              self.i18n.SUPPORT_BUNDLE_SUCCESS_MESSAGE.format(file_path=str(written)),
+                              parent=self)
+            open_btn = box.addButton(self.i18n.STATS_DETAIL_OPEN_FOLDER, QMessageBox.ButtonRole.AcceptRole)
+            box.addButton(QMessageBox.StandardButton.Ok)
+            box.exec()
+            if box.clickedButton() is open_btn:
+                reveal_in_explorer(str(written))
         except Exception as e:
             self.logger.error("Failed to export support bundle: %s", e, exc_info=True)
             QMessageBox.critical(

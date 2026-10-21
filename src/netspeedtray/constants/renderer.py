@@ -16,6 +16,18 @@ class RendererConstants:
     # so the readout doesn't crowd the tray-overflow chevron once it's anchored right. Larger than
     # TEXT_MARGIN (which only kept text off the very edge) - this is deliberate visual padding.
     RIGHT_ANCHOR_PADDING: Final[int] = 7
+
+    # --- Paused cue (Pause in the menu / click action) ---
+    # A paused widget draws its content at this opacity (still readable) and a two-bar pause glyph in
+    # place of the arrow column - or in the free left margin when no arrows are drawn - so frozen
+    # numbers read as paused rather than hung. The glyph never overlaps text.
+    PAUSED_CONTENT_OPACITY: Final[float] = 0.55
+    PAUSE_GLYPH_HEIGHT_RATIO: Final[float] = 0.45         # of the arrow column's height (both rows)
+    PAUSE_GLYPH_MARGIN_HEIGHT_RATIO: Final[float] = 0.3   # of the widget's height, margin placement
+    PAUSE_GLYPH_MIN_HEIGHT: Final[int] = 7
+    PAUSE_GLYPH_MAX_HEIGHT: Final[int] = 14
+    PAUSE_GLYPH_WIDTH_RATIO: Final[float] = 0.6           # glyph width (two bars + gap) per height
+    PAUSE_GLYPH_MARGIN_PAD: Final[int] = 2                # clear space each side in the margin
     GRAPH_MARGIN: Final[int] = 3
     GRAPH_LEFT_PADDING: Final[int] = 2
     GRAPH_RIGHT_PADDING: Final[int] = 2
@@ -31,6 +43,26 @@ class RendererConstants:
     GRAPH_Y_AXIS_PADDING_FACTOR: Final[float] = 1.15 # Add 15% headroom
     # Gap between the upload and download panels when the graphs are split (a faint divider sits in it).
     GRAPH_SPLIT_GAP: Final[int] = 4
+
+    # --- Mini graph "Trend" style (graph_style == "trend") ---
+    # Smoothing window as a fraction of the samples on screen (so the curve looks equally calm at any
+    # timespan / graph width), never fewer than TREND_MIN_WINDOW samples. 0.06 of a 3 min window at
+    # 1 s polls = 11 s; of a 30 min window = 108 s. See widget_renderer.trend_smooth().
+    TREND_WINDOW_FRACTION: Final[float] = 0.06
+    TREND_MIN_WINDOW: Final[int] = 3
+    # Window at the right edge ("now"), in samples: fixed, so the newest point's lag does not grow with
+    # the timespan (11 = the 3 min default's own window; ~11 s at 1 s polls).
+    TREND_EDGE_WINDOW: Final[int] = 11
+    # Ridge on the fitted slope at the series' ends (0 = full local-linear, large = plain truncated
+    # average): trades the edge's lag against its per-second wag. Numbers in trend_smooth's docstring.
+    TREND_EDGE_SLOPE_DAMPING: Final[float] = 0.5
+    TREND_LINE_WIDTH: Final[float] = 1.75
+    # Top alpha of an optional fill under a trend line, fading to 0 at the bottom like Detailed's
+    # (whose top alpha is 120). 0 = no fill, the choice: rendered side by side, a faint wash (36) was
+    # all but invisible on a dark bar at 1x and only tinted the text behind it on a light one - the
+    # Trend style's point is a clean line. Kept as a one-number switch.
+    TREND_FILL_ALPHA: Final[int] = 0
+
     # Two-row readout geometry, shared by the renderer and the layout's fit check (#322): the gap
     # between the upload and download rows, and the CPU/GPU icon box (drawn up from the baseline).
     TWO_ROW_GAP_PX: Final[int] = 1
