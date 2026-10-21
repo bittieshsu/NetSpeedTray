@@ -31,7 +31,28 @@ class RendererConstants:
     GRAPH_Y_AXIS_PADDING_FACTOR: Final[float] = 1.15 # Add 15% headroom
     # Gap between the upload and download panels when the graphs are split (a faint divider sits in it).
     GRAPH_SPLIT_GAP: Final[int] = 4
-    
+    # Two-row readout geometry, shared by the renderer and the layout's fit check (#322): the gap
+    # between the upload and download rows, and the CPU/GPU icon box (drawn up from the baseline).
+    TWO_ROW_GAP_PX: Final[int] = 1
+    HW_ICON_SIZE_PX: Final[int] = 11
+    # Rows of clear space the fit check keeps above the measured ink (hinting at 125/150% DPI).
+    INK_FIT_TOP_MARGIN_PX: Final[int] = 1
+    # Display scales the fit check must hold at (Windows' standard 100-250% steps).
+    INK_FIT_SCALES: Final[tuple] = (1.0, 1.25, 1.5, 1.75, 2.0, 2.25, 2.5)
+    # The fixed strings the docked readout paints, for the ink-extent fit check (#322) - each measured
+    # on its own, as it is drawn. The unit labels are added from the active locale at runtime. Only
+    # glyphs the readout really draws: a generic "gjpqy|" sample measured 1 px deeper than any of them.
+    INK_REFERENCE_STRINGS: Final[tuple] = ("0123456789.,", "100%", "(99°C, 250.0W)", "(N/A)",
+                                           "CPU GPU", "RAM VRAM", "99.9/99.9G")
+
+    # --- Side (LEFT/RIGHT) taskbar compact readout (the "fits" ladder T1-T5) ---
+    # Tighter than ARROW_NUMBER_GAP / VALUE_UNIT_GAP: on a 48 px bar (44 px inside the margins) the
+    # classic gaps alone cost 10 px. About one space wide in the default 9 pt font.
+    COMPACT_ARROW_GAP_PX: Final[int] = 2
+    COMPACT_UNIT_GAP_PX: Final[int] = 3
+    # Icon + gap in front of a compact CPU/GPU percent (the icon is HW_ICON_SIZE_PX wide).
+    COMPACT_HW_ICON_GAP_PX: Final[int] = 2
+
     # --- Display Cycling ---
     CYCLE_INTERVAL_MS: Final[int] = 5000 # 5 seconds per metric
     
