@@ -12,6 +12,7 @@ import logging
 from dataclasses import dataclass
 from typing import Optional, Tuple, List, Protocol, runtime_checkable, Dict, Any, TYPE_CHECKING
 import math
+import time
 import ctypes
 from ctypes import wintypes
 import win32con
@@ -56,6 +57,96 @@ _SetWindowLongPtr.restype = ctypes.c_void_p
 _SetWindowLongPtr.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_void_p]
 _GetWindowLongPtr.restype = ctypes.c_void_p
 _GetWindowLongPtr.argtypes = [wintypes.HWND, ctypes.c_int]
+
+# --- Burial recovery: re-seat directly above the taskbar (#314, #238, PR #327) ---
+# The owner link keeps the widget above the taskbar in theory, but the shell can still
+# raise the taskbar over it (Win10: maximize + restore; Win11: Start/flyout churn, hovering
+# grouped previews). Recovery seats the widget DIRECTLY above its taskbar - never at the
+# top of the topmost band - so anything already above the taskbar (open menus, jump lists,
+# tooltips, Start/Search/Widgets flyouts) stays above the widget, and SWP_NOOWNERZORDER
+# keeps the taskbar's owner cluster where it is (the #200 clipping came from dragging it
+# up). With that insertion point the re-seat no longer has to recognise popups at all.
+_SHELL_TASKBAR_CLASSES = ("Shell_TrayWnd", "Shell_SecondaryTrayWnd")
+_GW_HWNDPREV = 3
+_SWP_NOOWNERZORDER = 0x0200
+_RESEAT_SWP_FLAGS = (win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | win32con.SWP_NOACTIVATE
+                     | _SWP_NOOWNERZORDER)
+# Upper bound for the walk from the taskbar up to the top of the Z-order. The taskbar sits
+# near the top of the topmost band (a dozen windows above it on a live Win11 26200 probe),
+# so this never binds in practice; it only stops a pathological list from spinning.
+_ZORDER_WALK_LIMIT = 1024
+
+# GetWindowBand (user32, undocumented but exported since Win8). Win11 lifts the taskbar into
+# a higher Z-band while Start is open; a band-1 widget cannot be seated inside another band,
+# so the re-seat waits for the taskbar to come back instead of fighting it. None = unknown.
+try:
+    _GetWindowBandRaw = _user32.GetWindowBand
+    _GetWindowBandRaw.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    _GetWindowBandRaw.restype = wintypes.BOOL
+except AttributeError:
+    _GetWindowBandRaw = None
+
+
+def _window_band(hwnd: int) -> Optional[int]:
+    """The window's Z-band, or None when the API is missing or the call fails."""
+    if _GetWindowBandRaw is None or not hwnd:
+        return None
+    try:
+        band = wintypes.DWORD(0)
+        if _GetWindowBandRaw(hwnd, ctypes.byref(band)):
+            return int(band.value)
+    except Exception:
+        pass
+    return None
+
+
+# The taskbar's normal Z-band (ZBID_DESKTOP). Opening Start or Task View lifts the taskbar into a
+# higher band (6 on a live Win11 26200 probe) and the widget, owned by it, goes along. While it is
+# up there the GW_HWNDPREV walk from the taskbar no longer finds the widget, so the burial check
+# cannot tell burial from "moved with the taskbar" - it must not guess, re-seat or charge the
+# backoff; the band dropping back (a foreground / reorder event, or the 1 s tick) re-checks.
+# Only bands ABOVE the desktop band count as raised: a setup that keeps the taskbar in band 0
+# (or the API reporting it) must not switch recovery off.
+_ZBID_DESKTOP = 1
+# A taskbar that stays "raised" this long is not Start / Task View: it is a shell that keeps it
+# there. Log once and fall back to checking the Z-order as if the band were normal.
+_BAND_RAISED_FALLBACK_S = 60.0
+# Closing Start / Task View drops the taskbar back to band 1 with the widget UNDER it (~0.3 s
+# later on a live Win11 26200 probe). The first re-seat within this long of the last raised
+# observation is the shell's doing, not a fight: it is immediate and charges no backoff.
+_BAND_RETURN_GRACE_S = 3.0
+
+
+# Re-seat backoff, the safety net against a shell that re-buries the widget the instant it
+# is re-seated: the first recovery fires immediately, then each re-seat that does not hold
+# doubles the wait (1, 2, 4 ... 60 s). The seat above the taskbar cannot clip a menu, so the
+# backoff only has to stop a fight, not every recovery: it retires after the widget has
+# stayed on top for _RESEAT_HEALTHY_S. That is shorter than an ordinary gap between two user
+# actions that bury it (pasharm's Win10 repro buries it on every maximize/restore), so those
+# always recover at once, while a real fight still decays to one re-seat a minute.
+_RESEAT_BACKOFF_BASE_S = 1.0
+_RESEAT_BACKOFF_MAX_S = 60.0
+_RESEAT_BACKOFF_EXP_CAP = 6
+_RESEAT_HEALTHY_S = 10.0
+# The on-top stretch must be OBSERVED: checks run at least once a second while the widget is
+# shown, so a longer gap between two verified on-top checks (the widget was hidden, or nothing
+# checked) restarts the stretch instead of counting the unobserved time as healthy.
+_ON_TOP_MAX_GAP_S = 3.0
+
+
+class _TrayOverride:
+    """A TaskbarInfo view whose get_tray_rect() returns a substitute (or None), for placing the
+    widget while the real tray rect is not ready (see PositionManager._tray_rect_ready)."""
+
+    def __init__(self, info: Any, tray: Optional[Tuple[int, int, int, int]]) -> None:
+        self._info = info
+        self._tray = tray
+
+    def get_tray_rect(self) -> Optional[Tuple[int, int, int, int]]:
+        return self._tray
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._info, name)
 
 
 # Protocols
@@ -478,6 +569,28 @@ class PositionManager(QObject):
         # display we should float on instead of docking to the primary taskbar.
         self._free_float_active: bool = False
         self._free_float_screen: Optional[QScreen] = None
+        # Re-seat backoff state (see reseat_above_taskbar): consecutive acted re-seats grow
+        # the delay; steady-state health retires the escalation between episodes.
+        self._reseat_attempts: int = 0
+        self._last_reseat_ts: float = 0.0
+        self._first_recovery_logged: bool = False
+        # Start of the current continuous on-top stretch (is_buried_behind_taskbar);
+        # None while we have not verified we are on top. Gates backoff retirement.
+        self._on_top_since: Optional[float] = None
+        self._last_on_top_ts: float = 0.0   # last verified on-top check (gap detection)
+        # (reason, backoff window) of the last DEBUG-logged deferral - one line per window.
+        self._deferral_logged: Optional[tuple] = None
+        # Raised taskbar band (Start / Task View), see _taskbar_band_raised.
+        self._band_raised_since: Optional[float] = None
+        self._band_raised_last_ts: float = 0.0
+        self._band_fallback_logged: bool = False
+        # Last time the burial check saw the taskbar raised; a re-seat soon after it drops
+        # back is free (no backoff). 0.0 = no pending band return.
+        self._band_return_pending_ts: float = 0.0
+        # One INFO line per stretch of a not-ready tray rect (see _tray_rect_ready).
+        self._tray_not_ready_logged: bool = False
+        # Last good tray rect per (monitor, edge), as offsets from the taskbar's right/bottom.
+        self._last_good_tray: Dict[tuple, Tuple[int, int, int, int]] = {}
         
         # Timers
         self._tray_watcher_timer = QTimer(self)
@@ -549,12 +662,99 @@ class PositionManager(QObject):
             if self._free_float_active and self._apply_free_float_position():
                 return
 
+            # A just-restarted taskbar reports a degenerate tray rect for seconds (live: the
+            # TrayNotifyWnd sat at (0,1032,0,1032) for ~11 s until TaskbarCreated); computing
+            # from it snaps the widget to the far left, over the Widgets button. Place it on the
+            # new taskbar from the last good tray geometry instead.
+            if not self._tray_rect_ready():
+                self._apply_position_with_substitute_tray()
+                return
+
             if self._apply_calculated_position():
                 pass # success
             else:
                 logger.warning("Failed to calculate position.")
         except Exception as e:
             logger.error("Error updating position: %s", e, exc_info=True)
+
+    @staticmethod
+    def _tray_memory_key(info: Any) -> Optional[tuple]:
+        """(monitor, edge) the remembered tray geometry belongs to; None if it can't be told."""
+        try:
+            return (str(info.get_screen().name()), info.get_edge_position())
+        except Exception:
+            return None
+
+    def _remember_tray(self, info: Any, tray: Tuple[int, int, int, int]) -> None:
+        """Store a good tray rect as offsets from its taskbar's right/bottom edges (the tray
+        hugs that corner on every edge), so it can be re-applied to a new taskbar rect."""
+        key = self._tray_memory_key(info)
+        if key is None or not info.hwnd:
+            return
+        tb_right, tb_bottom = int(info.rect[2]), int(info.rect[3])
+        self._last_good_tray[key] = (tb_right - int(tray[0]), tb_bottom - int(tray[1]),
+                                     tb_right - int(tray[2]), tb_bottom - int(tray[3]))
+
+    def _apply_position_with_substitute_tray(self) -> None:
+        """
+        The tray rect is not ready: position on the CURRENT taskbar as if its tray had the last
+        good geometry seen on this monitor + edge. With nothing remembered (the very first
+        launch met a not-ready rect), use the "no tray" estimate the secondary-taskbar path
+        uses (screen edge minus a clock-width reserve).
+        """
+        info = self._state.taskbar_info
+        offsets = self._last_good_tray.get(self._tray_memory_key(info))
+        tray = None
+        if offsets is not None:
+            tb_right, tb_bottom = int(info.rect[2]), int(info.rect[3])
+            tray = (tb_right - offsets[0], tb_bottom - offsets[1],
+                    tb_right - offsets[2], tb_bottom - offsets[3])
+        widget = self._state.widget
+        size = (widget.width(), widget.height())
+        if size[0] <= 0:
+            return
+        pos = self._calculator.calculate_position(_TrayOverride(info, tray), size, self._state.config)
+        if pos:
+            self._apply_geometry(pos.x, pos.y)
+
+    def _tray_rect_ready(self) -> bool:
+        """
+        False while the docked taskbar's tray rect exists but cannot be real: zero width or
+        height, or not touching the taskbar at all - what a taskbar mid-(re)creation reports
+        after an Explorer restart. No tray rect at all (a Win11 secondary taskbar, the fallback
+        taskbar) is a known layout with its own estimate, so it counts as ready. A ready rect
+        is remembered for the next not-ready stretch. Logs once per not-ready stretch.
+        """
+        info = self._state.taskbar_info
+        ready = True
+        tray = None
+        try:
+            tray = info.get_tray_rect() if info is not None else None
+            if tray is not None:
+                left, top, right, bottom = (int(v) for v in tray)
+                tb_left, tb_top, tb_right, tb_bottom = (int(v) for v in info.rect)
+                if right <= left or bottom <= top:
+                    ready = False
+                elif right <= tb_left or left >= tb_right or bottom <= tb_top or top >= tb_bottom:
+                    ready = False
+        except Exception:
+            ready = True   # can't judge it: keep the old behaviour, never strand the widget
+            tray = None
+        if ready:
+            if tray is not None:
+                try:
+                    self._remember_tray(info, tray)
+                except Exception:
+                    pass
+            if self._tray_not_ready_logged:
+                logger.debug("Taskbar tray area is ready again - repositioning.")
+            self._tray_not_ready_logged = False
+            return True
+        if not self._tray_not_ready_logged:
+            logger.info("Taskbar tray area not ready yet (rect %s) - placing the widget from the "
+                        "last known tray geometry.", tray)
+            self._tray_not_ready_logged = True
+        return False
 
     def _apply_free_float_position(self) -> bool:
         """Place the widget at a sensible default on the taskbar-less preferred display (#188). Returns
@@ -740,11 +940,16 @@ class PositionManager(QObject):
 
     def reset_to_default(self) -> None:
         """
-        Resets the widget to its default position by clearing explicit position Config
-        and triggering a recalculation.
+        Resets the widget to its default position: clears the saved free-move spot AND the docked
+        drag offsets (tray_offset_x / tray_offset_y - a docked drag's offset otherwise outlived every
+        reset), and repositions.
         """
+        defaults = constants.config.defaults
         self._state.config['position_x'] = None
         self._state.config['position_y'] = None
+        self._state.config['tray_offset_x'] = defaults.DEFAULT_TRAY_OFFSET_X
+        self._state.config['tray_offset_y'] = defaults.DEFAULT_TRAY_OFFSET_Y
+        self._last_applied_geometry = None
         # We rely on the caller (Widget) to persist this config change to disk if needed.
         self.update_position()
         self.ensure_topmost()
@@ -817,6 +1022,11 @@ class PositionManager(QObject):
                     hwnd, win32con.HWND_TOPMOST, 0, 0, 0, 0,
                     win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | win32con.SWP_NOACTIVATE
                 )
+            # A widget that fell out of the topmost band (Qt can drop WS_EX_TOPMOST across
+            # show/flag changes) is necessarily BELOW the topmost taskbar, so it is "buried"
+            # in is_buried_behind_taskbar()'s terms and the widget's guarded recovery path
+            # (_recover_if_buried: menu / drag / fullscreen guards, backoff, deferral logging)
+            # restores it with the safe seat. Nothing is re-seated from here (#327 review).
         except Exception as e:
             logger.error("Failed to ensure topmost status: %s", e)
 
@@ -827,3 +1037,236 @@ class PositionManager(QObject):
         """
         if self._state.widget.isVisible():
             self.ensure_topmost()
+
+    def reset_reseat_state(self) -> None:
+        """Forget the burial-recovery backoff: a fresh taskbar (explorer restart) is a fresh start."""
+        self._reseat_attempts = 0
+        self._last_reseat_ts = 0.0
+        self._first_recovery_logged = False
+        self._on_top_since = None
+        self._deferral_logged = None
+        self._band_raised_since = None
+        self._band_raised_last_ts = 0.0
+        self._band_fallback_logged = False
+        self._band_return_pending_ts = 0.0
+
+    def _taskbar_band_raised(self, tb: int, now: float) -> Optional[int]:
+        """
+        The taskbar's band when it is known to be ABOVE the desktop band (Start / Task View
+        open), else None. A raised stretch that lasts over _BAND_RAISED_FALLBACK_S (observed
+        continuously, same gap rule as the on-top stretch) is a shell that keeps the taskbar
+        there: log once at INFO and report None, so the Z-order is checked as before.
+        """
+        band = _window_band(tb)
+        if band is None or band <= _ZBID_DESKTOP:
+            self._band_raised_since = None
+            self._band_fallback_logged = False
+            return None
+        if self._band_raised_since is None or now - self._band_raised_last_ts > _ON_TOP_MAX_GAP_S:
+            self._band_raised_since = now
+        self._band_raised_last_ts = now
+        if now - self._band_raised_since > _BAND_RAISED_FALLBACK_S:
+            if not self._band_fallback_logged:
+                logger.info("Taskbar has stayed in Z-band %s for over %.0fs - checking burial "
+                            "as if it were in the normal band.", band, _BAND_RAISED_FALLBACK_S)
+                self._band_fallback_logged = True
+            return None
+        return band
+
+    def _docked_taskbar_hwnd(self, hwnd: int) -> int:
+        """
+        The taskbar the widget is docked to: its owner (GWLP_HWNDPARENT) when that is a
+        taskbar window - the primary or a secondary one - else the detected taskbar. 0 if
+        neither is a live window.
+        """
+        try:
+            owner = int(_GetWindowLongPtr(hwnd, _GWLP_HWNDPARENT) or 0)
+            if owner and win32gui.IsWindow(owner) and \
+                    win32gui.GetClassName(owner) in _SHELL_TASKBAR_CLASSES:
+                return owner
+        except Exception:
+            pass
+        tb_info = self._state.taskbar_info
+        tb = int(tb_info.hwnd) if tb_info and tb_info.hwnd else 0
+        return tb if tb and win32gui.IsWindow(tb) else 0
+
+    @staticmethod
+    def _is_above_in_zorder(hwnd: int, other: int) -> Optional[bool]:
+        """
+        True when hwnd is above `other` in the Z-order, False when it is below, None when
+        the walk could not tell (it never acts on a guess). Walks GW_HWNDPREV from `other`
+        towards the top: a dozen steps for the taskbar.
+        """
+        cur = other
+        for _ in range(_ZORDER_WALK_LIMIT):
+            cur = win32gui.GetWindow(cur, _GW_HWNDPREV) or 0
+            if not cur:
+                return False
+            if cur == hwnd:
+                return True
+        return None
+
+    def is_buried_behind_taskbar(self) -> bool:
+        """
+        True when the widget is visible but sits BELOW its taskbar in Z-order - invisible to
+        the user although isVisible() is True (#314, #238).
+
+        The owner link (GWLP_HWNDPARENT) is supposed to make that impossible, yet the shell
+        does it anyway (pasharm: maximize + restore on Win10 raises the taskbar over the
+        widget with the owner link intact; kamal63442 saw it on a fresh Win11 launch). The
+        check is a pure Z-order comparison: no hit-test, so no DPI conversion and no need to
+        tell a covering menu from the taskbar - a menu above the widget is not burial, and
+        a widget under the taskbar is burial even while a menu covers its centre.
+
+        Also tracks how long the widget has stayed on top, which retires the re-seat backoff.
+        """
+        try:
+            widget = self._state.widget
+            if not widget.isVisible():
+                self.note_on_top_unverified()
+                return False
+            hwnd = int(widget.winId())
+            if not hwnd or not win32gui.IsWindow(hwnd):
+                self.note_on_top_unverified()
+                return False
+            tb = self._docked_taskbar_hwnd(hwnd)
+            if not tb:
+                self.note_on_top_unverified()
+                return False
+            raised = self._taskbar_band_raised(tb, time.monotonic())
+            if raised is not None:
+                # Start / Task View is open: the Z-order walk cannot verify anything (PR #327 B1).
+                # Closing it buries the widget; that re-seat must not count as a fight (M1).
+                self._band_return_pending_ts = time.monotonic()
+                self.note_on_top_unverified()
+                self._log_deferral(
+                    "tb-band", "Burial check deferred: the taskbar is in Z-band %s (Start / Task View).",
+                    raised)
+                return False
+            above = self._is_above_in_zorder(hwnd, tb)
+            if above is None:
+                self.note_on_top_unverified()
+                return False
+            if above:
+                now = time.monotonic()
+                if self._on_top_since is None or now - self._last_on_top_ts > _ON_TOP_MAX_GAP_S:
+                    self._on_top_since = now
+                elif (self._reseat_attempts or self._last_reseat_ts) and \
+                        now - self._on_top_since >= _RESEAT_HEALTHY_S:
+                    # The last re-seat held: retire the escalation, so the next burial
+                    # recovers at once and logs at INFO again.
+                    self.reset_reseat_state()
+                    self._on_top_since = now
+                self._last_on_top_ts = now
+                return False
+            self._on_top_since = None
+            return True
+        except Exception as e:
+            self.note_on_top_unverified()
+            logger.debug("Buried-behind-taskbar check failed: %s", e)
+            return False
+
+    def note_on_top_unverified(self) -> None:
+        """
+        A check that could not confirm the widget is on top (hidden, a fullscreen app, our
+        own menu open, ...) breaks the continuous on-top stretch that retires the backoff -
+        otherwise a hide/show in the middle of a fight would count as "held" (#327 review).
+        """
+        self._on_top_since = None
+
+    def reseat_above_taskbar(self) -> bool:
+        """
+        Re-insert the widget directly above its taskbar in Z-order (pasharm's insertion
+        point): hWndInsertAfter = the window right above the taskbar, or HWND_TOPMOST when
+        the taskbar is first in the Z-order. Flags: NOMOVE | NOSIZE | NOACTIVATE |
+        NOOWNERZORDER - never moves, never takes focus, never drags the taskbar's owner
+        cluster (#200).
+
+        Because everything already above the taskbar stays above the widget, this cannot
+        clip an open menu, jump list or flyout, and it never lifts the widget over a
+        fullscreen app: the shell drops the taskbar out of the topmost band under one, and
+        the re-seat refuses to follow it there.
+
+        Guards, in order (each one defers; the next event or the 1 s tick retries):
+        backoff -> taskbar not topmost -> taskbar out of its normal Z-band -> widget in another
+        Z-band -> already seated.
+
+        Returns True when the widget was actually re-seated.
+        """
+        try:
+            hwnd = int(self._state.widget.winId())
+            if not hwnd or not win32gui.IsWindow(hwnd):
+                return False
+            now = time.monotonic()
+            # The burial the shell leaves behind when Start / Task View closes: re-seat at once
+            # and charge nothing, or quick repeated Win+Tab escalates the backoff (M1).
+            band_return = bool(self._band_return_pending_ts) and                 now - self._band_return_pending_ts <= _BAND_RETURN_GRACE_S
+            delay = self._reseat_delay()
+            if not band_return and self._last_reseat_ts and (now - self._last_reseat_ts) < delay:
+                self._log_deferral("backoff", "Re-seat deferred: backoff (%.0fs window).", delay)
+                return False
+            tb = self._docked_taskbar_hwnd(hwnd)
+            if not tb:
+                return False
+            if not (win32gui.GetWindowLong(tb, win32con.GWL_EXSTYLE) & win32con.WS_EX_TOPMOST):
+                # A fullscreen app (or anything else) took the taskbar out of the topmost band:
+                # following it down would put the widget under that window - leave it alone.
+                self._log_deferral("tb-not-topmost", "Re-seat deferred: the taskbar is not topmost.")
+                return False
+            raised = self._taskbar_band_raised(tb, now)
+            if raised is not None:
+                self._log_deferral(
+                    "tb-band", "Re-seat deferred: the taskbar is in Z-band %s (Start / Task View).", raised)
+                return False
+            own_band, tb_band = _window_band(hwnd), _window_band(tb)
+            if own_band is not None and tb_band is not None and own_band != tb_band:
+                self._log_deferral(
+                    "band", "Re-seat deferred: taskbar is in Z-band %s, the widget in %s.",
+                    tb_band, own_band)
+                return False
+            prev = int(win32gui.GetWindow(tb, _GW_HWNDPREV) or 0)
+            if prev == hwnd:
+                return False  # already directly above the taskbar
+            insert_after = prev if prev else win32con.HWND_TOPMOST
+            try:
+                win32gui.SetWindowPos(hwnd, insert_after, 0, 0, 0, 0, _RESEAT_SWP_FLAGS)
+            except Exception as e:
+                if prev and not win32gui.IsWindow(prev):
+                    # The window above the taskbar (often a transient tooltip) was destroyed
+                    # between GetWindow and SetWindowPos. Benign: no backoff charged, the
+                    # next Z-order event or tick retries against the new neighbour.
+                    logger.debug("Re-seat raced a closing window (%s) - retrying on the next check.", e)
+                    return False
+                raise
+            self._deferral_logged = None
+            if band_return:
+                self._band_return_pending_ts = 0.0   # consumed; the backoff is untouched
+                logger.debug("Widget re-seated above the taskbar after Start / Task View closed "
+                             "(no backoff charged).")
+                return True
+            self._last_reseat_ts = now
+            self._reseat_attempts = min(self._reseat_attempts + 1, _RESEAT_BACKOFF_EXP_CAP + 1)
+            self._deferral_logged = None
+            if self._first_recovery_logged:
+                logger.debug("Widget re-seated above the taskbar (attempt %d).", self._reseat_attempts)
+            else:
+                logger.info("Widget recovered from taskbar burial - re-seated directly above the taskbar.")
+                self._first_recovery_logged = True
+            return True
+        except Exception as e:
+            logger.error("Failed to re-seat the widget above the taskbar: %s", e)
+            return False
+
+    def _log_deferral(self, reason: str, msg: str, *args) -> None:
+        """DEBUG-log a deferred re-seat once per (reason, backoff window), not once per tick."""
+        key = (reason, self._last_reseat_ts)
+        if self._deferral_logged != key:
+            self._deferral_logged = key
+            logger.debug(msg, *args)
+
+    def _reseat_delay(self) -> float:
+        """Seconds of quiet required before the next re-seat: 0 first, then doubling, capped."""
+        if not self._last_reseat_ts:
+            return 0.0
+        return min(_RESEAT_BACKOFF_BASE_S * (2 ** min(self._reseat_attempts - 1, _RESEAT_BACKOFF_EXP_CAP)),
+                   _RESEAT_BACKOFF_MAX_S)

@@ -44,7 +44,7 @@ from netspeedtray.utils.widget_paint import WidgetMetrics, render_widget, split_
 from netspeedtray.core.system_events import SystemEventHandler
 from netspeedtray.views.widget.layout import WidgetLayoutManager
 from netspeedtray.views.widget.theme import WidgetThemeManager
-from netspeedtray.core.startup_manager import StartupManager
+from netspeedtray.core.startup_manager import StartupManager, is_process_elevated
 from netspeedtray.core.config_controller import ConfigController
 from netspeedtray.core.update_checker import UpdateChecker
 from netspeedtray.core import shutdown_channel
@@ -81,6 +81,29 @@ _WM_ENDSESSION = 0x0016
 _SESSION_END_DB_WAIT_S = 2.0
 _PBT_APMRESUMESUSPEND = 0x0007
 _PBT_APMRESUMEAUTOMATIC = 0x0012
+
+# "TaskbarCreated" is broadcast by explorer whenever the taskbar window is
+# (re)created - the canonical re-attach signal for tray-docked windows, and the
+# instant alternative to waiting out the 3s validity poll after an explorer
+# restart. RegisterWindowMessageW returns one system-wide atom for the string, so
+# resolving it once at import is correct for the process lifetime. 0 means
+# registration failed, in which case nativeEvent skips the branch and the
+# validity poll remains the only (slower) recovery path.
+try:
+    _WM_TASKBARCREATED = int(ctypes.windll.user32.RegisterWindowMessageW("TaskbarCreated"))
+except Exception:
+    _WM_TASKBARCREATED = 0
+
+# UIPI: a process running elevated silently drops messages broadcast by the
+# non-elevated shell, so without MSGFLT_ALLOW on our window the TaskbarCreated
+# re-dock never fires there. Per-window API, resolved once at import.
+_MSGFLT_ALLOW = 1
+try:
+    _ChangeWindowMessageFilterEx = ctypes.windll.user32.ChangeWindowMessageFilterEx
+    _ChangeWindowMessageFilterEx.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.DWORD, ctypes.c_void_p]
+    _ChangeWindowMessageFilterEx.restype = wintypes.BOOL
+except AttributeError:  # pre-Win7, unlikely
+    _ChangeWindowMessageFilterEx = None
 
 # The installer's graceful-close request (setup.iss [Code], or `--shutdown`; core/shutdown_channel.py). A registered
 # message: one system-wide atom per string, so resolving it once at import is correct. 0 = failed,
@@ -206,6 +229,9 @@ class NetworkSpeedWidget(QWidget):
         self.ram_total: Optional[float] = None
         self.vram_used: Optional[float] = None
         self.vram_total: Optional[float] = None
+        # True when vram_used/vram_total are an integrated GPU's shared system memory (set by the
+        # controller from the stats dict's 'vram_is_shared').
+        self.vram_is_shared: bool = False
         
         # Cycling State
         self._cycle_index: int = 0
@@ -237,11 +263,17 @@ class NetworkSpeedWidget(QWidget):
         # Hover usage card - a Win11 flyout we position ourselves (above the taskbar) so it is
         # never clipped, unlike Qt's built-in tooltip. Shown after a short rest on the widget.
         self._hover_card = None
+        # Click-to-pin: a pinned card ignores the pointer leaving and stays until a 2nd click, another
+        # app coming to the front, the context menu, the double-click action, a drag, a fullscreen app
+        # or a dock change (InputHandler drives the clicks).
+        self._hover_card_pinned: bool = False
         self._hover_card_timer = QTimer(self)
         self._hover_card_timer.setSingleShot(True)
         self._hover_card_timer.timeout.connect(self._show_usage_hover_card)
         self._hover_usage_cache: Optional[Tuple[Tuple[float, float], Tuple[float, float]]] = None
         self._hover_usage_cache_ts: float = 0.0
+        # HWND the TaskbarCreated UIPI filter was last applied to (see _allow_taskbar_created).
+        self._taskbar_created_allowed: int = 0
         self._hover_battery_avg_cache: Optional[float] = None
         self._hover_battery_avg_cache_ts: float = 0.0
         self._hover_usage_period_start: Optional[datetime] = None   # set by _hover_usage_totals
@@ -401,6 +433,9 @@ class NetworkSpeedWidget(QWidget):
         free-float (#188) - where a taskbar-less preferred monitor falls back to the
         primary taskbar, so a fullscreen app on the primary would otherwise transiently
         hide the off-taskbar widget. Mirrors the visibility gate in _execute_refresh()."""
+        # Never leave an always-on-top card (pinned or not) over a game/video - even when the widget
+        # itself stays (keep_visible_fullscreen / free-float).
+        self.dismiss_hover_card()
         if self.config.get("keep_visible_fullscreen", False):
             return
         if self.position_manager and self.position_manager.is_free_float_active():
@@ -471,6 +506,9 @@ class NetworkSpeedWidget(QWidget):
                 
                 # Always re-assert topmost status when visible to prevent falling behind taskbar (#77)
                 self._ensure_win32_topmost()
+
+                # (_ensure_win32_topmost also runs _recover_if_buried: the 1 s safety net behind
+                # the event-driven burial recovery.)
 
                 # One-time heads-up if we're sitting over the Win11 Widgets/weather panel (#200).
                 self._maybe_nudge_widgets_overlap(taskbar_info)
@@ -788,6 +826,8 @@ class NetworkSpeedWidget(QWidget):
         self.upload_speed = upload_mbps
         self.download_speed = download_mbps
         self.update() # Trigger a repaint
+        if getattr(self, "_hover_card_pinned", False):
+            self._refresh_pinned_usage()
 
 
     def _bar_shows(self, modes: Tuple[str, ...]) -> bool:
@@ -925,6 +965,9 @@ class NetworkSpeedWidget(QWidget):
 
     def _on_theme_changed(self) -> None:
         """Delegates theme change handling."""
+        # An open card (pinned ones last for minutes) keeps the old theme's colours: close it; the
+        # next hover builds it in the new theme.
+        self.dismiss_hover_card()
         self.theme_manager.on_theme_changed()
 
 
@@ -999,6 +1042,7 @@ class NetworkSpeedWidget(QWidget):
 
             # 1. System Event Handler (replaces manual WinEventHooks)
             self.system_event_handler.foreground_app_changed.connect(self._execute_refresh)
+            self.system_event_handler.foreground_app_changed.connect(self._on_foreground_for_hover_card)
             self.system_event_handler.taskbar_changed.connect(self.update_position)
             self._refresh_cached_layout_mode()
             self.system_event_handler.theme_changed.connect(self._on_theme_changed)
@@ -1020,8 +1064,14 @@ class NetworkSpeedWidget(QWidget):
             # slow and shows as a "hide and return"). Restores a410aae's _handle_taskbar_focus.
             self.system_event_handler.taskbar_focused.connect(self._ensure_win32_topmost)
 
-            # Handle taskbar restarts
-            self.system_event_handler.taskbar_restarted.connect(lambda: [QTimer.singleShot(i * constants.timeouts.TASKBAR_RESTART_RECOVERY_DELAY_MS, self._execute_refresh) for i in range(constants.timeouts.TASKBAR_RESTART_RETRIES)])
+            # Handle taskbar restarts - both the 3s validity poll and the instant
+            # TaskbarCreated broadcast (nativeEvent) land in _recover_taskbar_restarted.
+            self.system_event_handler.taskbar_restarted.connect(self._recover_taskbar_restarted)
+
+            # Burial recovery, event-driven (#314, #238): the shell raised a window - possibly
+            # the taskbar over the widget. Coalesced in SystemEventHandler; the check itself is
+            # a short Z-order walk, and it re-seats only when the widget really is buried.
+            self.system_event_handler.zorder_changed.connect(self._recover_if_buried)
 
             # React to monitor topology changes (add/remove/primary swap, KVM, dock/undock):
             # re-validate the position + re-assert the widget. A set-and-forget app must follow
@@ -1172,6 +1222,8 @@ class NetworkSpeedWidget(QWidget):
     _HOVER_CARD_DELAY_MS = 350
     # Cache window for the (today, this-month) DB totals so rapid hovers don't hammer the DB.
     _HOVER_USAGE_TTL_SEC = 30.0
+    # Hover-opened cards that carry the "Click to keep this open" footer (fewer once pinned: 0).
+    _PIN_HINT_MAX_SHOWS = 5
 
     def invalidate_usage_cache(self) -> None:
         """Drop the hover card's cached today/this-month totals so the next hover re-reads them
@@ -1204,16 +1256,124 @@ class NetworkSpeedWidget(QWidget):
         super().enterEvent(event)
 
     def leaveEvent(self, event) -> None:
-        """When the pointer leaves the widget, cancel/hide the usage card."""
-        try:
-            self._hover_card_timer.stop()
-            self._hide_usage_hover_card()
-        except Exception as e:
-            self.logger.debug("hover card hide failed: %s", e)
+        """When the pointer leaves the widget, cancel/hide the usage card - unless it is pinned."""
+        self._on_pointer_left()
         super().leaveEvent(event)
 
-    def _show_usage_hover_card(self) -> None:
-        """Build and show the usage card just above the widget (never under the taskbar)."""
+    def _on_pointer_left(self) -> None:
+        try:
+            self._hover_card_timer.stop()
+            if not self._hover_card_pinned:
+                self._hide_usage_hover_card()
+        except Exception as e:
+            self.logger.debug("hover card hide failed: %s", e)
+
+    # --- Click-to-pin (side-taskbar design §2, Phase B) -------------------------------------------
+
+    def hover_card_state(self) -> Optional[str]:
+        """"pinned", "hover" (shown by resting the pointer) or None (no card up)."""
+        if self._hover_card is None:
+            return None
+        return "pinned" if self._hover_card_pinned else "hover"
+
+    def pin_hover_card(self) -> None:
+        """Keep the card open: pin the one showing from hover, or (a touch tap / a click before the
+        hover delay) open it pinned. Pinning itself never activates anything: the card keeps its
+        no-activate style and is only moved / restyled. The click that pins it, though, lands on the
+        widget, and the widget only *shows* without activating (WA_ShowWithoutActivating) - a click
+        still makes it the foreground window, as every click on it always has, so the app the user
+        was typing in loses the keyboard. That foreground change is ours, so it does not close the
+        card (``_on_foreground_for_hover_card``)."""
+        self._hover_card_timer.stop()
+        card = self._hover_card
+        if card is None:
+            self._show_usage_hover_card(pinned=True)
+            return
+        self._hover_card_pinned = True
+        set_pinned = getattr(card, "set_pinned", None)
+        if callable(set_pinned):
+            set_pinned(True)
+        self._retire_pin_hint()
+
+    def _retire_pin_hint(self) -> None:
+        """The user has pinned a card: they know the gesture - stop showing the footer line."""
+        try:
+            if int(self.config.get("pin_hint_shown_count", 0)) < self._PIN_HINT_MAX_SHOWS:
+                self.config_controller.update_config(
+                    {"pin_hint_shown_count": self._PIN_HINT_MAX_SHOWS}, apply_and_repaint=False)
+        except Exception as e:
+            self.logger.debug("pin hint retire failed: %s", e)
+
+    def _pin_hint_text(self) -> Optional[str]:
+        """The "Click to keep this open" footer for a card opened by hover: on the first
+        _PIN_HINT_MAX_SHOWS such cards (its own counter - independent of the gesture hint's
+        graduation, which may already be over for an upgrader), and never again once pinned."""
+        try:
+            count = int(self.config.get("pin_hint_shown_count", 0))
+            if count >= self._PIN_HINT_MAX_SHOWS:
+                return None
+            self.config_controller.update_config({"pin_hint_shown_count": count + 1},
+                                                 apply_and_repaint=False)
+            return self.i18n.HOVER_CARD_PIN_HINT
+        except Exception:
+            return None
+
+    def dismiss_hover_card(self) -> None:
+        """Close the card (pinned or not), cancel a pending hover show and a pending click-to-pin."""
+        try:
+            self._hover_card_timer.stop()
+        except Exception:
+            pass
+        handler = getattr(self, "input_handler", None)
+        cancel = getattr(handler, "cancel_pending_click", None)
+        if callable(cancel):
+            cancel()
+        self._hide_usage_hover_card()
+
+    def _reanchor_hover_card(self) -> None:
+        """The widget moved without a dock change (tray grew, reposition): a pinned card follows it.
+        A hover card needs nothing - the pointer leaving the moved widget closes it."""
+        card = getattr(self, "_hover_card", None)    # moveEvent can fire mid-__init__
+        if card is None or not getattr(self, "_hover_card_pinned", False):
+            return
+        try:
+            card.reanchor(self.frameGeometry())
+        except Exception as e:
+            self.logger.debug("hover card re-anchor failed: %s", e)
+
+    def _refresh_pinned_usage(self) -> None:
+        """A pinned card stays up for minutes: keep its usage rows current, at the hardware rows'
+        cadence (the totals themselves are TTL-cached, so this is not a DB read per tick)."""
+        card = self._hover_card
+        if card is None or not self._hover_card_pinned or not self.config.get("show_usage_on_hover", True):
+            return
+        now = time.monotonic()
+        if now - getattr(self, "_hover_usage_refreshed", 0.0) < self._HOVER_HW_REFRESH_SEC:
+            return
+        self._hover_usage_refreshed = now
+        try:
+            today, month = self._hover_usage_totals()
+            card.update_usage(today, month, self._hover_cap_info())
+        except Exception as e:
+            self.logger.debug("pinned card usage refresh failed: %s", e)
+
+    def _on_foreground_for_hover_card(self, hwnd: int = 0) -> None:
+        """Another app came to the front: a pinned card has done its job. Our own windows (the widget
+        itself when clicked, the card, a menu) don't count."""
+        if not self._hover_card_pinned or not hwnd:
+            return
+        try:
+            import win32process
+            _tid, pid = win32process.GetWindowThreadProcessId(int(hwnd))
+            if pid == os.getpid():
+                return
+        except Exception:
+            pass
+        self.dismiss_hover_card()
+
+    def _show_usage_hover_card(self, pinned: bool = False) -> None:
+        """Build and show the usage card just above the widget (never under the taskbar). ``pinned``
+        opens it already pinned (a click/tap, not a hover)."""
         if self._is_context_menu_visible or self._dragging or not self.isVisible():
             return
         # Don't pop an always-on-top card over a fullscreen app, even when the widget itself is
@@ -1238,9 +1398,18 @@ class NetworkSpeedWidget(QWidget):
             month_label = (self.i18n.USAGE_THIS_PERIOD_LABEL
                            if today is not None and getattr(self, "_hover_usage_period_start", None)
                            else None)
+            # "Click to keep this open" footer: on a card opened by hover only (a pinned card is
+            # already open), for the first few such cards.
+            pin_hint = None if pinned else self._pin_hint_text()
             card = UsageFlyout(self.i18n, today, month, hint=hint, cap=cap, power=power,
-                               history_note=note, hardware=hardware, month_label=month_label)
+                               history_note=note, hardware=hardware, month_label=month_label,
+                               pin_hint=pin_hint)
+            self._hover_card_pinned = bool(pinned)
             self._hover_hw_refreshed = time.monotonic()
+            self._hover_usage_refreshed = time.monotonic()
+            dismiss_signal = getattr(card, "dismiss_requested", None)
+            if dismiss_signal is not None:
+                dismiss_signal.connect(self.dismiss_hover_card)   # a click on the pinned card
             screen = self.screen() or QApplication.primaryScreen()
             avail = screen.availableGeometry() if screen else self.frameGeometry()
             # Never stack two cards - but show the new one BEFORE the old one goes: a rebuild
@@ -1248,6 +1417,9 @@ class NetworkSpeedWidget(QWidget):
             # no frame in between, instead of a visible blink.
             old, self._hover_card = self._hover_card, card
             card.show_for(self.frameGeometry(), avail, edge=self._hover_card_edge(), screen=screen)
+            if pinned:
+                card.set_pinned(True)    # opened by a click/tap: takes clicks (not pass-through)
+                self._retire_pin_hint()
             if old is not None:
                 try:
                     old.hide()
@@ -1258,7 +1430,8 @@ class NetworkSpeedWidget(QWidget):
             self.logger.error("Error showing usage hover card: %s", e, exc_info=True)
 
     def _hide_usage_hover_card(self) -> None:
-        """Tear down the usage card if one is up."""
+        """Tear down the usage card if one is up (pinned or not)."""
+        self._hover_card_pinned = False
         card, self._hover_card = self._hover_card, None
         if card is not None:
             try:
@@ -1503,6 +1676,8 @@ class NetworkSpeedWidget(QWidget):
                 hw["ram"] = (self.ram_used, self.ram_total)
             if "GPU" in stats and cfg.get("monitor_vram_enabled", False):
                 hw["vram"] = (self.vram_used, self.vram_total)
+                if getattr(self, "vram_is_shared", False):
+                    hw["vram_shared"] = True
         if fit is not None and fit.hides_identity:
             band, _color, _solid = self._identity_presentation()
             parts = [p for p in (self._identity_ssid_text(), band) if p]
@@ -1548,7 +1723,12 @@ class NetworkSpeedWidget(QWidget):
             power = (self._hover_power_summary()
                      if self.config.get("power_display_enabled", False) else None)
             if power is None or not card.update_power(power):
-                self._show_usage_hover_card()          # builds the new card, then hides this one
+                # Builds the new card, then hides this one. A pinned card stays pinned across the
+                # rebuild (a plug-in while the user reads the pinned card must not unpin it).
+                if getattr(self, "_hover_card_pinned", False):
+                    self._show_usage_hover_card(pinned=True)
+                else:
+                    self._show_usage_hover_card()
                 if self._hover_card is card:           # nothing to show (or not now): close it
                     self._hide_usage_hover_card()
         except Exception as e:
@@ -1659,6 +1839,10 @@ class NetworkSpeedWidget(QWidget):
             event.ignore()
 
 
+    def moveEvent(self, event) -> None:
+        super().moveEvent(event)
+        self._reanchor_hover_card()
+
     def showEvent(self, event: QShowEvent) -> None:
         self.logger.debug(f"Widget showEvent triggered. New visibility: {self.isVisible()}")
         super().showEvent(event)
@@ -1757,8 +1941,51 @@ class NetworkSpeedWidget(QWidget):
     def _ensure_win32_topmost(self) -> None:
         """Delegates to PositionManager. No-op while hidden (e.g. over a fullscreen app)."""
         if not self.isVisible():
+            pm = getattr(self, "position_manager", None)
+            if pm is not None:
+                pm.note_on_top_unverified()   # hidden time never counts as "held" on top
             return
+        self._allow_taskbar_created()
         self.position_manager.ensure_topmost()
+        # Burial / lost-topmost recovery, through the one guarded path (#327 review).
+        self._recover_if_buried()
+
+    def _allow_taskbar_created(self) -> None:
+        """
+        Allow "TaskbarCreated" through UIPI on our native window (ChangeWindowMessageFilterEx).
+
+        Without this, a process running elevated silences the shell's broadcast and the
+        instant re-dock only ever fires from the 3 s validity poll (the insta-recover
+        from TaskbarCreated goes off). Idempotent per native window: re-applied when Qt
+        hands us a fresh HWND after a native-window recreation.
+        """
+        if not _WM_TASKBARCREATED or _ChangeWindowMessageFilterEx is None:
+            return
+        try:
+            hwnd = int(self.winId())
+        except Exception:
+            return
+        if not hwnd or hwnd == getattr(self, "_taskbar_created_allowed", 0):
+            return
+        try:
+            # Four arguments: the prototype declares a (nullable) FILTER_STATUS
+            # pointer slot, so a 3-arg call raises TypeError and the ctypes
+            # try/except would silently swallow it - leaving the UIPI filter
+            # never applied (#327 review).
+            ok = _ChangeWindowMessageFilterEx(hwnd, _WM_TASKBARCREATED, _MSGFLT_ALLOW, None)
+            if not ok:
+                # TRUE=1 on success. Do not cache: a later call retries.
+                self.logger.debug(
+                    "ChangeWindowMessageFilterEx(TaskbarCreated) returned FALSE on HWND %s (elevated=%s) - will retry.",
+                    hwnd, is_process_elevated()
+                )
+                return
+            self._taskbar_created_allowed = hwnd
+            self.logger.debug(
+                "TaskbarCreated allowed through UIPI on HWND %s (elevated=%s).", hwnd, is_process_elevated()
+            )
+        except Exception as e:
+            self.logger.debug("ChangeWindowMessageFilterEx(TaskbarCreated) failed: %s", e)
 
     def _on_environment_changed(self, reason: str = "") -> None:
         """
@@ -1816,7 +2043,10 @@ class NetworkSpeedWidget(QWidget):
                     self._save_session_essentials(
                         "query-end-session" if msg.message == _WM_QUERYENDSESSION else "end-session")
                     return False, 0
-                if msg.message == _WM_POWERBROADCAST and msg.wParam in (
+                if _WM_TASKBARCREATED and msg.message == _WM_TASKBARCREATED:
+                    self.logger.info("TaskbarCreated received - re-docking to the new taskbar.")
+                    self._recover_taskbar_restarted()
+                elif msg.message == _WM_POWERBROADCAST and msg.wParam in (
                     _PBT_APMRESUMESUSPEND, _PBT_APMRESUMEAUTOMATIC
                 ):
                     self.logger.info("Resume from sleep detected - re-asserting widget.")
@@ -1829,19 +2059,77 @@ class NetworkSpeedWidget(QWidget):
             self.logger.debug("nativeEvent power handling failed: %s", e)
         return False, 0
 
+    def _recover_if_buried(self) -> None:
+        """
+        Put the widget back on top of its taskbar if the shell buried it (#314, #238).
+
+        Ownership keeps the widget above the taskbar in theory, but the shell can raise the
+        taskbar over it without breaking the owner link, and steady-state ensure_topmost()
+        deliberately never touches Z-order (#200). Runs on every coalesced Z-order change
+        (EVENT_OBJECT_REORDER / foreground) and on the 1 s safety-net tick; re-seats the
+        widget directly above the taskbar only when it really is below it.
+
+        Skipped while hidden, while our own menu is open or a drag is under way, and while a
+        fullscreen app owns the screen - with Keep visible in fullscreen on, the widget's
+        place over the video stays exactly as it was before this recovery existed.
+        """
+        try:
+            pm = getattr(self, "position_manager", None)
+            if pm is None:
+                return
+            handler = getattr(self, "system_event_handler", None)
+            if (not self.isVisible() or self._is_context_menu_visible or self._dragging
+                    or (handler is not None and handler.is_fullscreen_active())):
+                pm.note_on_top_unverified()   # not a verified on-top tick (backoff stretch)
+                return
+            if pm.is_buried_behind_taskbar():
+                pm.reseat_above_taskbar()
+        except Exception as e:
+            self.logger.debug("Burial recovery check failed: %s", e)
+
+    def _recover_taskbar_restarted(self) -> None:
+        """
+        Explorer is (re)building the taskbar. Ride out the shell's startup with the
+        established staggered refreshes: each pass re-detects the taskbar, re-docks
+        the owner link and seats the widget back in the topmost band once detection
+        succeeds. Fired by the 3s validity poll and - via nativeEvent - by the
+        TaskbarCreated broadcast, which arrives the moment the new taskbar window
+        exists instead of up to a poll interval later.
+        """
+        try:
+            pm = getattr(self, "position_manager", None)
+            if pm is not None:
+                pm.reset_reseat_state()   # a new taskbar starts a new burial history
+            for i in range(constants.timeouts.TASKBAR_RESTART_RETRIES):
+                QTimer.singleShot(i * constants.timeouts.TASKBAR_RESTART_RECOVERY_DELAY_MS,
+                                  self._execute_refresh)
+        except Exception as e:
+            self.logger.error("Error recovering from taskbar restart: %s", e, exc_info=True)
+
     def _enforce_topmost_status(self) -> None:
         """Delegates to PositionManager."""
         self.position_manager.enforce_topmost_status()
 
     def reset_to_default_position(self) -> None:
-        """
-        Resets the widget to its default position using PositionManager.
-        """
+        """Right-click > Reset position: back to the automatic spot by the tray - clears the
+        free-move spot AND the docked drag offsets, then re-places."""
         self.logger.info("Resetting widget position to default.")
+        self._hide_usage_hover_card()
+        defaults = constants.config.defaults
         self.position_manager.reset_to_default()
-        
-        # Save the cleared config state
-        self.update_config({'position_x': None, 'position_y': None})
+        # Persist exactly what reset_to_default cleared in the (shared) config dict.
+        self.update_config({'position_x': None, 'position_y': None,
+                            'tray_offset_x': defaults.DEFAULT_TRAY_OFFSET_X,
+                            'tray_offset_y': defaults.DEFAULT_TRAY_OFFSET_Y})
+
+    def has_custom_position(self) -> bool:
+        """Whether the widget sits where the user put it (a drag, or a saved free-move spot) - the
+        tray menu offers Reset position only then."""
+        defaults = constants.config.defaults
+        cfg = self.config or {}
+        return (cfg.get('position_x') is not None or cfg.get('position_y') is not None
+                or cfg.get('tray_offset_x', defaults.DEFAULT_TRAY_OFFSET_X) != defaults.DEFAULT_TRAY_OFFSET_X
+                or cfg.get('tray_offset_y', defaults.DEFAULT_TRAY_OFFSET_Y) != defaults.DEFAULT_TRAY_OFFSET_Y)
 
 
     def apply_all_settings(self) -> None:
