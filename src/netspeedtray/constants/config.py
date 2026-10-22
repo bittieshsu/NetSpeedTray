@@ -40,7 +40,13 @@ class ConfigConstants:
     # presets. The bump is what makes load() keep a `.bak.v1.1` of the 2.1.x file before migrating it;
     # 2.1.x leaves a newer version untouched (verified against the 2.1.7 tree).
     CONFIG_SCHEMA_VERSION: Final[str] = "1.2"
-    
+    # A same-version field migration (e.g. dropping a beta's key) rewrites the file without a schema
+    # bump. The first `.bak.v<ver>.fields` copy is kept forever (the pristine one); each LATER such
+    # migration also snapshots the file as it was just before it, as `.fields.<timestamp>`, and only
+    # the newest few of those are kept - enough to undo the last few rewrites, bounded on disk
+    # (rc.2 D3). They are taken only when a migration is about to write, never on a plain launch.
+    FIELD_MIGRATION_SNAPSHOTS_KEPT: Final[int] = 3
+
     # --- Default Values for Individual Settings (referencing other constants) ---
     DEFAULT_UPDATE_RATE: Final[float] = 1.0
     DEFAULT_FONT_FAMILY: Final[str] = fonts.DEFAULT_FONT
@@ -146,6 +152,15 @@ class ConfigConstants:
     DEFAULT_SHOW_MEMORY_LABELS: Final[bool] = False
     DEFAULT_SHOW_HARDWARE_TEMPS: Final[bool] = True
     DEFAULT_SHOW_HARDWARE_POWER: Final[bool] = False
+    # Temperature unit for every temperature the app SHOWS (taskbar, hover card, Monitor, Settings'
+    # throttle slider). Stored values stay Celsius everywhere - sensors, history DB, throttle_temp_c,
+    # the CSV/JSON export (a stable machine-readable unit, already labelled "°C") - and only the
+    # formatter converts (rc.2 F8; the v1.4.0 "Fahrenheit support is planned" promise, O6).
+    TEMPERATURE_UNIT_CHOICES: Final[List[str]] = ["celsius", "fahrenheit"]
+    DEFAULT_TEMPERATURE_UNIT: Final[str] = "celsius"
+    # GPU picker (#236): "" = Automatic (busiest engine on any adapter - the pre-picker readout), or
+    # the DXGI Description of the adapter to show. See constants.gpu.ADAPTER_AUTO.
+    DEFAULT_GPU_ADAPTER: Final[str] = ""
     DEFAULT_STACK_HARDWARE_STATS: Final[bool] = True
     # Side-taskbar design phase C: keep the taskbar widget to network speed and show the enabled
     # CPU/GPU/memory in the hover card instead. Off by default, so nobody's widget changes.
@@ -273,6 +288,8 @@ class ConfigConstants:
         "show_memory_labels": DEFAULT_SHOW_MEMORY_LABELS,
         "show_hardware_temps": DEFAULT_SHOW_HARDWARE_TEMPS,
         "show_hardware_power": DEFAULT_SHOW_HARDWARE_POWER,
+        "temperature_unit": DEFAULT_TEMPERATURE_UNIT,
+        "gpu_adapter": DEFAULT_GPU_ADAPTER,
         # Settings > Advanced > "Record hardware history". Persists hardware samples to the history DB,
         # but ONLY for metrics the user monitors (CPU/GPU/RAM switches, temps/power switches) - see
         # controller.hardware_persist_allowed. Off = nothing hardware is written; live display (widget,
@@ -445,6 +462,8 @@ class ConfigConstants:
         "plan_up_mbps": {"type": (int, float), "default": 0, "min": 0, "max": 100000},
         "throttle_temp_c": {"type": (int, float), "default": 0, "min": 0, "max": 130},
         "show_hardware_power": {"type": bool, "default": DEFAULT_SHOW_HARDWARE_POWER},
+        "temperature_unit": {"type": str, "default": DEFAULT_TEMPERATURE_UNIT, "choices": TEMPERATURE_UNIT_CHOICES},
+        "gpu_adapter": {"type": str, "default": DEFAULT_GPU_ADAPTER},
         "stack_hardware_stats": {"type": bool, "default": DEFAULT_STACK_HARDWARE_STATS},
         "hardware_in_hover_card": {"type": bool, "default": DEFAULT_HARDWARE_IN_HOVER_CARD},
         "widget_display_mode": {"type": str, "default": DEFAULT_WIDGET_DISPLAY_MODE, "choices": ["network_only", "cycle", "side_by_side"]},

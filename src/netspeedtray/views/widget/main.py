@@ -1668,7 +1668,11 @@ class NetworkSpeedWidget(QWidget):
                 if key.upper() in stats:
                     stat: Dict[str, Any] = {"usage": usage}
                     if temps:
-                        stat["temp"] = temp
+                        stat["temp"] = temp   # Celsius; the card converts to temp_unit (rc.2 F8)
+                        from netspeedtray.utils.helpers import temperature_unit
+                        unit = temperature_unit(cfg)
+                        if unit != constants.hardware.temperature.CELSIUS:
+                            hw["temp_unit"] = unit   # absent = Celsius, the snapshot as before
                     if power:
                         stat["power"] = watts
                     hw[key] = stat
@@ -2254,6 +2258,11 @@ class NetworkSpeedWidget(QWidget):
 
     def check_for_updates(self) -> None:
         """Manually trigger an update check (from menu)."""
+        from netspeedtray.core.update_checker import update_check_disabled_by_policy
+        if update_check_disabled_by_policy():
+            # The menu item is hidden under the policy (U1); a stale menu opened just before the
+            # policy landed must not wire the one-shot replies to a check that will never run.
+            return
         if self.update_checker:
             # update_available is already wired to _on_update_available at construction
             # (persistent, see __init__). Do NOT connect a second handler here: on a manual

@@ -468,6 +468,12 @@ class Win11Slider(QWidget):
             return self._special_value_text
         return f"{value}{self._suffix}"
 
+    def setSuffix(self, suffix: str) -> None:
+        """Change the unit shown after the number (e.g. "°C" -> "°F" when the temperature unit flips)."""
+        self._suffix = suffix or ""
+        if self._auto_update_label:
+            self.setValueText(self._format_value(self.slider.value()))
+
     def setSpecialValueText(self, text: str) -> None:
         """Show ``text`` instead of the number at the minimum - e.g. "Off" for a 0 that disables the
         feature, rather than a misleading "0°C". Same contract as QAbstractSpinBox.setSpecialValueText."""
@@ -750,6 +756,16 @@ class SettingCard(QFrame):
     def control(self) -> Optional[QWidget]:
         return self._control
 
+    def setDescriptionVisible(self, visible: bool) -> None:
+        """Show or hide the description line - and drop it from the control's accessible description
+        while hidden, so a screen reader never announces text that is not on screen."""
+        desc = getattr(self, "_desc_label", None)
+        if desc is None:
+            return
+        desc.setVisible(visible)
+        for w in self._named:
+            w.setAccessibleDescription(desc.text() if visible else "")
+
     def isStacked(self) -> bool:
         """True while the control sits under the title (the card is too narrow for one row)."""
         return self._row.direction() == QBoxLayout.Direction.TopToBottom
@@ -770,7 +786,7 @@ class SettingCard(QFrame):
             one_line = lbl.fontMetrics().horizontalAdvance(lbl.text()) + 2
             need = max(need, min(one_line, constants.layout.SETTING_CARD_MIN_TITLE_WIDTH))
         desc = getattr(self, "_desc_label", None)
-        if desc is not None:
+        if desc is not None and not desc.isHidden():
             need = max(need, desc.minimumSizeHint().width())
             if side_by_side:
                 # The same rule for the description: beside the control it keeps a readable column
