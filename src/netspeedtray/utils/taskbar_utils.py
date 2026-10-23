@@ -13,7 +13,7 @@ import threading
 import time
 from ctypes import wintypes, windll, byref, Structure
 from dataclasses import dataclass
-from typing import Tuple, Optional, List, Any
+from typing import Tuple, Optional, List, Any, Dict
 import psutil
 
 # Win32 Imports
@@ -36,8 +36,9 @@ from netspeedtray import constants
 from netspeedtray.utils.config import stable_pseudonym
 
 logger = logging.getLogger("NetSpeedTray.TaskbarUtils")
-# Caches to improve performance and prevent log spam for invalid handles
-_dpi_cache: dict = {}
+# Monitor handles whose DPI query failed once: the fallback warning is logged once per handle.
+# (No DPI VALUE cache: an HMONITOR survives a live display-scale change, so a cached scale went stale
+# until restart - the rc.2 live-DPI bugs. GetDpiForMonitor is a cheap user-mode call.)
 _logged_warnings: set = set()
 
 
@@ -193,7 +194,9 @@ def find_apps_rect(taskbar_hwnd: int) -> Optional[Tuple[int, int, int, int]]:
 # background thread. Unlike the #200 Widgets probe this one has NO periodic refresh: it is requested
 # at startup, on a dock change, on Reset position, and - as re-checks that KEEP the last result until
 # the new one lands (``keep_last``) - when core/side_bar_watcher predicts the app group reaching the
-# widget or sees the icon alignment flip. It never runs for a TOP/BOTTOM bar today (#24 may reuse it).
+# widget or sees the icon alignment flip. On a TOP/BOTTOM bar only the #24 app-button yield
+# (core/app_overlap_yield.py) runs it - keep_last re-checks that read the contiguous app group and
+# never change the horizontal placement.
 _layout_lock = threading.Lock()
 # Notified (under _layout_lock) whenever a probe lands or a request ends: wait_for_taskbar_layout.
 _layout_landed = threading.Condition(_layout_lock)
@@ -778,35 +781,33 @@ class TaskbarInfo:
 # Core Utility Functions
 def get_dpi_for_monitor(monitor: Any, hwnd: Optional[int] = None) -> Optional[float]:
     """
-    Retrieves the DPI scaling factor for a given monitor using Windows API.
-    Caches results and warnings to improve performance and reduce log spam.
+    The CURRENT DPI scaling factor of a monitor (Windows API), read on every call.
+
+    Never cached: a monitor keeps its HMONITOR across a live Settings > Display > Scale change, and a
+    per-handle cache (1.0.5 - rc.2) kept the old scale until restart - a 100% -> 150% change made the
+    #24 app-button yield compare physical px with logical px and hide the widget, 150% -> 100% sized it
+    for a 32-px "Small" bar. A failed query falls back to the primary QScreen's ratio, read fresh too;
+    its warning is logged once per handle.
     """
     try:
         monitor_id = int(monitor)
     except (TypeError, ValueError):
         monitor_id = 0
 
-    if monitor_id in _dpi_cache:
-        return _dpi_cache[monitor_id]
-
-    if monitor_id in _logged_warnings:
-        return 1.0  # Return a safe default for already-warned invalid handles
-
-
     def get_fallback_dpi() -> float:
-        """Helper to get DPI from Qt and log a warning once per invalid handle."""
-        logger.warning("Falling back to QScreen for DPI detection for monitor handle '%s'.", monitor_id)
-        _logged_warnings.add(monitor_id)
+        """The primary QScreen's ratio; the warning once per invalid handle."""
+        if monitor_id not in _logged_warnings:
+            logger.warning("Falling back to QScreen for DPI detection for monitor handle '%s'.", monitor_id)
+            _logged_warnings.add(monitor_id)
         screen = QApplication.primaryScreen()
         dpi_scale = screen.devicePixelRatio() if screen else 1.0
-        _dpi_cache[monitor_id] = dpi_scale
-        return dpi_scale
+        return dpi_scale if dpi_scale and dpi_scale > 0 else 1.0
 
     try:
         MDT_EFFECTIVE_DPI = 0
         dpi_x = ctypes.c_uint()
         dpi_y = ctypes.c_uint()
-        
+
         monitor_handle = wintypes.HMONITOR(monitor_id)
 
         result = ctypes.windll.shcore.GetDpiForMonitor(
@@ -815,15 +816,13 @@ def get_dpi_for_monitor(monitor: Any, hwnd: Optional[int] = None) -> Optional[fl
             byref(dpi_x),
             byref(dpi_y)
         )
-        
+
         if result != 0:  # S_OK is 0, anything else is an error
             return get_fallback_dpi()
 
         dpi = dpi_x.value / 96.0
         if dpi <= 0:
             return get_fallback_dpi()
-
-        _dpi_cache[monitor_id] = dpi
         return dpi
 
     except (AttributeError, NameError):
@@ -832,6 +831,23 @@ def get_dpi_for_monitor(monitor: Any, hwnd: Optional[int] = None) -> Optional[fl
     except Exception as e:
         logger.error("Unexpected error getting DPI for monitor %s: %s", monitor_id, e, exc_info=True)
         return get_fallback_dpi()
+
+
+def current_dpi_for_hwnd(hwnd: int) -> Optional[float]:
+    """The scale of the monitor ``hwnd`` is on RIGHT NOW (a TaskbarInfo snapshot can be a tick old);
+    None when it can't be read (no such window). Never the primary's scale for a dead handle -
+    MonitorFromWindow(DEFAULTTONEAREST) would answer that for anything."""
+    try:
+        if not hwnd or not win32gui.IsWindow(hwnd):
+            return None
+        monitor = win32api.MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)
+        if not monitor:
+            return None
+        dpi = get_dpi_for_monitor(monitor, hwnd)
+        return dpi if dpi and dpi > 0 else None
+    except Exception as e:
+        logger.debug("current DPI for HWND %s failed: %s", hwnd, e)
+        return None
 
 
 def _taskbar_window_is_ready(hwnd: int, class_name: str) -> bool:
@@ -944,6 +960,13 @@ def get_all_taskbar_info() -> List[TaskbarInfo]:
                 return None
 
             rect_phys = win32gui.GetWindowRect(hwnd)
+            if rect_phys[2] <= rect_phys[0] or rect_phys[3] <= rect_phys[1]:
+                # A taskbar collapsed to zero width/height is going away (its display was unplugged,
+                # or Explorer is tearing it down). Not an error: the next enumeration no longer has it
+                # (#434 live run - this was 3-4 ERROR lines per unplug, from the 1 s mirror tick).
+                logger.debug("Taskbar HWND %s (%s) has an empty rect %s - going away. Ignoring.",
+                             hwnd, class_name, rect_phys)
+                return None
             tray_hwnd = win32gui.FindWindowEx(hwnd, 0, "TrayNotifyWnd", None) or None
             tasklist_rect_phys = find_tasklist_rect(hwnd)
             
@@ -1063,7 +1086,10 @@ def _select_taskbar_for_screen(
 # taskbar-less accessory display like the Corsair Xeneon Edge, #188) otherwise spammed this INFO line
 # every second and bloated Support Bundles. Keyed on (preferred, taskbar set) so a genuine topology
 # change (monitor plugged/unplugged, or a changed preference) still logs once more.
-_last_fallback_log_key: Optional[tuple] = None
+# Throttled PER preferred name ({preferred: taskbar set}): with "Show on all taskbars" (#229) the main
+# widget and each mirror resolve different preferred screens every tick, and one shared key made
+# them evict each other - every lookup logged again. None (tests reset it so) means empty.
+_last_fallback_log_key: Optional[Dict[str, tuple]] = None
 
 
 def _log_preferred_monitor_fallback(
@@ -1079,10 +1105,12 @@ def _log_preferred_monitor_fallback(
     safety-net refresh can't spam it (#188).
     """
     global _last_fallback_log_key
-    key = (preferred_screen_name, tuple(sorted((tb.hwnd, tb.screen_name) for tb in taskbars)))
-    if key == _last_fallback_log_key:
+    if _last_fallback_log_key is None:
+        _last_fallback_log_key = {}
+    key = tuple(sorted((tb.hwnd, tb.screen_name) for tb in taskbars))
+    if _last_fallback_log_key.get(preferred_screen_name) == key:
         return
-    _last_fallback_log_key = key
+    _last_fallback_log_key[preferred_screen_name] = key
 
     details = []
     for tb in taskbars:

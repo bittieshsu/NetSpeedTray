@@ -8,7 +8,6 @@ handling loading, saving, application, and rollback of settings.
 import logging
 from typing import Any, Dict, Optional, TYPE_CHECKING
 
-from PyQt6.QtGui import QColor
 
 from netspeedtray import constants
 from netspeedtray.utils.window_state import set_window_always_on_top
@@ -214,11 +213,6 @@ class ConfigController:
                 self.logger.debug("Applying widget state config...")
                 w.widget_state.apply_config(w.config)
 
-            self.logger.debug("Synchronizing internal QColor objects.")
-            w.default_color = QColor(w.config.get("default_color", constants.config.defaults.DEFAULT_COLOR))
-            w.high_color = QColor(w.config.get("high_speed_color", constants.config.defaults.DEFAULT_HIGH_SPEED_COLOR))
-            w.low_color = QColor(w.config.get("low_speed_color", constants.config.defaults.DEFAULT_LOW_SPEED_COLOR))
-
             # If the user disables temperature/power display, clear any stale values
             # so layout calculation and rendering immediately reflect the change.
             if not w.config.get("show_hardware_temps", False):
@@ -239,6 +233,11 @@ class ConfigController:
             # 3. AFTER resizing, update the position.
             self.logger.debug("Updating widget position...")
             w.update_position()
+
+            # 3a. "Show on all taskbars" (#229): build / retire / re-size the mirrors after the main
+            # widget has its new size. Nothing is built or connected while the setting is off.
+            if hasattr(w, "apply_mirrors"):
+                w.apply_mirrors()
             
             # 4. Manage Cycling Timer (stopped while "Show hardware in the hover card" collapses the
             # widget to network-only - nothing to rotate; the saved Auto-Cycle comes back with it off)

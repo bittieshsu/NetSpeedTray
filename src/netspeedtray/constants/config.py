@@ -1,7 +1,7 @@
 """
 Constants for application configuration defaults and constraints.
 """
-from typing import Final, Dict, Any, List
+from typing import Final, Dict, Any, List, Tuple
 
 # --- IMPORT OTHER CONSTANTS TO CREATE A SINGLE SOURCE OF TRUTH ---
 from netspeedtray.constants.data import data
@@ -40,7 +40,15 @@ class ConfigConstants:
     # 1.2 (2.2): hardware_label_style split into style + hardware_label_color, update_rate snapped to
     # presets. The bump is what makes load() keep a `.bak.v1.1` of the 2.1.x file before migrating it;
     # 2.1.x leaves a newer version untouched (verified against the 2.1.7 tree).
-    CONFIG_SCHEMA_VERSION: Final[str] = "1.2"
+    # 1.3 (2.2 rc.2): the colour scheme - every themed colour is a `<stem>_dark` / `<stem>_light` pair
+    # (THEMED_COLOR_STEMS) and the theme no longer writes the text colour into the file. The bump keeps a
+    # `.bak.v1.2`; the pre-1.3 colour keys stay in the file, inert, so rc.1 / 2.1.x still read them.
+    # 1.4 (2.2 rc.2, legibility package "L"): new factory band colours, font and arrow font. A one-time
+    # step (utils/config._migrate_to_1_4) moves only values still on the OLD factory default - a dark High
+    # of exactly #00FF00, the font "Segoe UI" (-> "Segoe UI Variable"), the separate 10 pt DemiBold Segoe UI
+    # arrow font - to the new
+    # defaults; anything else is the user's choice and stays. The bump keeps a `.bak.v1.3` (or `.bak.v1.2`).
+    CONFIG_SCHEMA_VERSION: Final[str] = "1.4"
     # A same-version field migration (e.g. dropping a beta's key) rewrites the file without a schema
     # bump. The first `.bak.v<ver>.fields` copy is kept forever (the pristine one); each LATER such
     # migration also snapshots the file as it was just before it, as `.fields.<timestamp>`, and only
@@ -53,7 +61,9 @@ class ConfigConstants:
     DEFAULT_FONT_FAMILY: Final[str] = fonts.DEFAULT_FONT
     DEFAULT_FONT_SIZE: Final[int] = 9
     DEFAULT_FONT_WEIGHT: Final[int] = fonts.WEIGHT_NORMAL
-    DEFAULT_USE_SEPARATE_ARROW_FONT: Final[bool] = True
+    # Off since 1.4 (7b): the arrows are drawn in the text's own font and weight, like the clock's text -
+    # the old separate 10 pt DemiBold arrow looked bolted on. Users who set an arrow font keep it.
+    DEFAULT_USE_SEPARATE_ARROW_FONT: Final[bool] = False
     DEFAULT_ARROW_FONT_FAMILY: Final[str] = fonts.DEFAULT_FONT
     DEFAULT_ARROW_FONT_SIZE: Final[int] = 10
     DEFAULT_ARROW_FONT_WEIGHT: Final[int] = fonts.WEIGHT_DEMIBOLD
@@ -62,14 +72,66 @@ class ConfigConstants:
     # color languages (direction vs magnitude), which is a real design change, so it is off by
     # default and existing widgets render byte-identically after an upgrade (#168).
     DEFAULT_USE_CUSTOM_ARROW_COLORS: Final[bool] = False
+    # The colour defaults below are the DARK-taskbar ones (the pre-2.2 single values, so a dark widget
+    # is unchanged); each themed colour's light-taskbar default is in THEMED_COLOR_DEFAULTS.
     DEFAULT_ARROW_UP_COLOR: Final[str] = color.GREEN
     DEFAULT_ARROW_DOWN_COLOR: Final[str] = color.WHITE
     DEFAULT_COLOR: Final[str] = color.WHITE # Referencing color palette
     DEFAULT_COLOR_CODING: Final[bool] = False
     DEFAULT_HIGH_SPEED_THRESHOLD: Final[float] = 10.0
     DEFAULT_LOW_SPEED_THRESHOLD: Final[float] = 1.0
-    DEFAULT_HIGH_SPEED_COLOR: Final[str] = color.GREEN # Referencing color palette
+    # Optional third level between Low and High (#9). 0 = Off: three bands, exactly as before.
+    DEFAULT_MEDIUM_SPEED_THRESHOLD: Final[float] = 0.0
+    DEFAULT_HIGH_SPEED_COLOR: Final[str] = color.HIGH_SPEED_DARK   # #00FF00 before 1.4 (see color.py)
+    DEFAULT_MEDIUM_SPEED_COLOR: Final[str] = color.AMBER
     DEFAULT_LOW_SPEED_COLOR: Final[str] = color.ORANGE # Referencing color palette
+
+    # --- The colour scheme (2.2 rc.2; #117, #332, #9) ---
+    # Every foreground colour the widget paints has a dark-taskbar and a light-taskbar value, stored as
+    # `<stem>_dark` / `<stem>_light`; utils/color_scheme.resolve() picks the half for the current WINDOWS
+    # mode (SystemUsesLightTheme - the taskbar's theme, not the app mode). The theme never writes the
+    # config. The stems are the pre-2.2 key names, so RenderConfig's field names did not change. The
+    # light defaults are readable on a light taskbar (constants/color.py has the contrast figures).
+    # Kept global, on purpose: background_color (a surface, usually transparent) and the custom CPU/GPU
+    # label colours (their Brand default already follows the taskbar).
+    THEME_SUFFIXES: Final[Tuple[str, str]] = ("dark", "light")
+    THEMED_COLOR_DEFAULTS: Final[Dict[str, Tuple[str, str]]] = {   # stem: (dark, light)
+        "default_color": (DEFAULT_COLOR, color.TEXT_LIGHT),
+        "high_speed_color": (DEFAULT_HIGH_SPEED_COLOR, color.HIGH_SPEED_LIGHT),
+        "medium_speed_color": (DEFAULT_MEDIUM_SPEED_COLOR, color.MEDIUM_SPEED_LIGHT),
+        "low_speed_color": (DEFAULT_LOW_SPEED_COLOR, color.LOW_SPEED_LIGHT),
+        "graph_upload_color": (color.WIDGET_UPLOAD_LINE_DARK, color.WIDGET_UPLOAD_LINE_LIGHT),
+        "graph_download_color": (color.DOWNLOAD_LINE_COLOR, color.DOWNLOAD_LINE_LIGHT),
+        "arrow_up_color": (DEFAULT_ARROW_UP_COLOR, color.ARROW_UP_LIGHT),
+        "arrow_down_color": (DEFAULT_ARROW_DOWN_COLOR, color.TEXT_LIGHT),
+    }
+    THEMED_COLOR_STEMS: Final[Tuple[str, ...]] = tuple(THEMED_COLOR_DEFAULTS)
+    # The pre-1.3 single-value keys. No longer read or written: the 1.3 migration seeds the pairs from
+    # them, then they stay in the file untouched (and unvalidated) so a rollback to rc.1 / 2.1.x still
+    # finds the colours it had. test_color_scheme guards that no module reads them.
+    LEGACY_COLOR_KEYS: Final[Tuple[str, ...]] = (
+        "default_color", "color_is_automatic", "high_speed_color", "low_speed_color",
+        "arrow_up_color", "arrow_down_color",
+    )
+    # The factory value each pre-1.3 single key shipped with (the 1.2 -> 1.3 seeding's "nobody chose this"
+    # test). Pinned here, NOT read from the current defaults: High's dark default moved in 1.4, and
+    # comparing a 2.1.x file's #00FF00 against the new mint would have copied the old green to both
+    # taskbars as if the user had picked it.
+    LEGACY_COLOR_FACTORY: Final[Dict[str, str]] = {
+        "high_speed_color": color.LEGACY_HIGH_SPEED_DARK, "low_speed_color": color.ORANGE,
+        "arrow_up_color": color.GREEN, "arrow_down_color": color.WHITE,
+    }
+    # The 1.4 step (legibility "L"): config key -> (old factory value, new default). Applied once, to a
+    # file older than 1.4, and only where the value is EXACTLY the old factory one (compared
+    # case-insensitively). Medium and the light colours never shipped before 1.3 (#441), so they need none.
+    MIGRATE_1_4_DEFAULTS: Final[Dict[str, Tuple[str, str]]] = {
+        "high_speed_color_dark": (color.LEGACY_HIGH_SPEED_DARK, color.HIGH_SPEED_DARK),
+        "font_family": (fonts.LEGACY_DEFAULT_FONT, fonts.DEFAULT_FONT),
+        "arrow_font_family": (fonts.LEGACY_DEFAULT_FONT, fonts.DEFAULT_FONT),
+    }
+    # ...and the separate arrow font, on only because it was the old default: on, at exactly the old
+    # family / size / weight -> off (the arrows then follow the text font, 7b).
+    LEGACY_ARROW_FONT: Final[Tuple[str, int, int]] = (fonts.LEGACY_DEFAULT_FONT, 10, fonts.WEIGHT_DEMIBOLD)
     DEFAULT_BACKGROUND_COLOR: Final[str] = "#000000" # Black
     DEFAULT_BACKGROUND_OPACITY: Final[int] = 0 # Percentage (0-100), default transparent
     DEFAULT_GRAPH_ENABLED: Final[bool] = False
@@ -111,6 +173,12 @@ class ConfigConstants:
     # just works; a user can turn it off to keep the old primary-taskbar fallback (#188).
     DEFAULT_FREE_FLOAT: Final[bool] = True
     DEFAULT_KEEP_VISIBLE_FULLSCREEN: Final[bool] = False
+    # #24: on a native horizontal Win11 taskbar, hide while the app buttons reach the widget (the
+    # owner's "yield" choice, rc.2 W17). Off = the widget stays put and may cover them (pre-rc.2).
+    DEFAULT_HIDE_WHEN_APPS_COVER: Final[bool] = True
+    # "Show on all taskbars" (#229): a paint-only copy of the widget on every OTHER taskbar (Windows'
+    # "Show my taskbar on all displays"). Off by default - with it off no mirror code runs at all.
+    DEFAULT_SHOW_ON_ALL_TASKBARS: Final[bool] = False
     DEFAULT_FORCE_DECIMALS: Final[bool] = True
     # ON by default: a taskbar status widget people want always-present should come back after a reboot.
     # First launch reconciles this with the actual HKCU Run key (main.py → StartupManager.synchronize_startup_task),
@@ -203,12 +271,9 @@ class ConfigConstants:
         "font_size": DEFAULT_FONT_SIZE,
         "font_weight": DEFAULT_FONT_WEIGHT,
         "color_coding": DEFAULT_COLOR_CODING,
-        "default_color": DEFAULT_COLOR,
-        "color_is_automatic": True,
         "high_speed_threshold": DEFAULT_HIGH_SPEED_THRESHOLD,
+        "medium_speed_threshold": DEFAULT_MEDIUM_SPEED_THRESHOLD,
         "low_speed_threshold": DEFAULT_LOW_SPEED_THRESHOLD,
-        "high_speed_color": DEFAULT_HIGH_SPEED_COLOR,
-        "low_speed_color": DEFAULT_LOW_SPEED_COLOR,
         "graph_enabled": DEFAULT_GRAPH_ENABLED,
         "history_minutes": DEFAULT_HISTORY_MINUTES,
         "graph_opacity": DEFAULT_GRAPH_OPACITY,
@@ -249,6 +314,7 @@ class ConfigConstants:
         "cpu_label_color": DEFAULT_CPU_LABEL_COLOR,
         "gpu_label_color": DEFAULT_GPU_LABEL_COLOR,
         "keep_visible_fullscreen": DEFAULT_KEEP_VISIBLE_FULLSCREEN,
+        "hide_when_apps_cover": DEFAULT_HIDE_WHEN_APPS_COVER,
         "force_decimals": DEFAULT_FORCE_DECIMALS,
         "unit_type": DEFAULT_UNIT_TYPE,
         "swap_upload_download": DEFAULT_SWAP_UPLOAD_DOWNLOAD,
@@ -283,8 +349,6 @@ class ConfigConstants:
         "arrow_font_weight": DEFAULT_ARROW_FONT_WEIGHT,
         # Custom arrow glyphs (#129). Empty = the native i18n arrow (the Windows default).
         "use_custom_arrow_colors": DEFAULT_USE_CUSTOM_ARROW_COLORS,
-        "arrow_up_color": DEFAULT_ARROW_UP_COLOR,
-        "arrow_down_color": DEFAULT_ARROW_DOWN_COLOR,
         "arrow_up_symbol": "",
         "arrow_down_symbol": "",
         "monitor_cpu_enabled": DEFAULT_MONITOR_CPU_ENABLED,
@@ -333,6 +397,10 @@ class ConfigConstants:
         "location_onboarding_dismissed": False,  # user permanently dismissed the SSID/Location explainer
         "widgets_overlap_nudge_shown": False,  # one-time #200 nudge: widget overlaps the Widgets/weather panel
         "side_bar_no_room_notice_shown": False,  # one-time heads-up: a side taskbar's apps leave no free spot
+        "app_overlap_notice_shown": False,  # one-time heads-up: the widget stepped aside for app buttons (#24)
+        # The tray_offset_x the user dropped the widget at ON the app buttons (#24 drop baseline): the
+        # yield stays off for that spot, across restarts, until a probe sees it clear once. None = none.
+        "app_overlap_drop_offset": None,
         "cpu_load_high_threshold": DEFAULT_CPU_LOAD_HIGH_THRESHOLD,
         "cpu_load_low_threshold": DEFAULT_CPU_LOAD_LOW_THRESHOLD,
         "gpu_load_high_threshold": DEFAULT_GPU_LOAD_HIGH_THRESHOLD,
@@ -347,6 +415,7 @@ class ConfigConstants:
         "history_upgrade_notice_shown": False,  # the one "history upgraded" flyout after v7 -> v8
         "temp_onboarding_dismissed": False,  # user opted out of the no-sensor temp explainer
         "preferred_monitor": None,
+        "show_on_all_taskbars": DEFAULT_SHOW_ON_ALL_TASKBARS,
         # --- Data-usage / data-cap ---
         "data_cap_enabled": False,
         "data_cap_gb": 0.0,                # the cap in GB (0 = unset)
@@ -361,6 +430,12 @@ class ConfigConstants:
         "metrics_endpoint_port": network.metrics.DEFAULT_PORT,
     }
     
+    # The 16 themed colour keys, generated from THEMED_COLOR_DEFAULTS.
+    # (Plain loops: a comprehension in a class body cannot see the class's other names.)
+    for _stem, _pair in THEMED_COLOR_DEFAULTS.items():
+        for _i, _suffix in enumerate(THEME_SUFFIXES):
+            DEFAULT_CONFIG[f"{_stem}_{_suffix}"] = _pair[_i]
+
     # --- Schema Definition for Modern Config Validation ---
     VALIDATION_SCHEMA: Final[Dict[str, Dict[str, Any]]] = {
         "config_version": {"type": str, "default": CONFIG_SCHEMA_VERSION},
@@ -373,12 +448,11 @@ class ConfigConstants:
         "font_size": {"type": int, "default": DEFAULT_FONT_SIZE, "min": fonts.FONT_SIZE_MIN, "max": fonts.FONT_SIZE_MAX},
         "font_weight": {"type": int, "default": DEFAULT_FONT_WEIGHT, "min": 1, "max": 1000},
         "color_coding": {"type": bool, "default": DEFAULT_COLOR_CODING},
-        "default_color": {"type": str, "default": DEFAULT_COLOR, "regex": r"#[0-9a-fA-F]{6}"},
-        "color_is_automatic": {"type": bool, "default": True},
         "high_speed_threshold": {"type": (int, float), "default": DEFAULT_HIGH_SPEED_THRESHOLD, "min": 0, "max": ui_constants.sliders.SPEED_THRESHOLD_MAX_HIGH},
+        # 0 (Off) or strictly between Low and High - the cross-field rule in utils/config.py resets a
+        # misplaced Medium alone, never the user's High / Low.
+        "medium_speed_threshold": {"type": (int, float), "default": DEFAULT_MEDIUM_SPEED_THRESHOLD, "min": 0, "max": ui_constants.sliders.SPEED_THRESHOLD_MAX_LOW},
         "low_speed_threshold": {"type": (int, float), "default": DEFAULT_LOW_SPEED_THRESHOLD, "min": 0, "max": ui_constants.sliders.SPEED_THRESHOLD_MAX_LOW},
-        "high_speed_color": {"type": str, "default": DEFAULT_HIGH_SPEED_COLOR, "regex": r"#[0-9a-fA-F]{6}"},
-        "low_speed_color": {"type": str, "default": DEFAULT_LOW_SPEED_COLOR, "regex": r"#[0-9a-fA-F]{6}"},
         "graph_enabled": {"type": bool, "default": DEFAULT_GRAPH_ENABLED},
         "history_minutes": {"type": int, "default": DEFAULT_HISTORY_MINUTES, "min": 1, "max": 1440}, # Range from manual check
         # "coerce": accepted as int or float (older files / hand edits), stored as a rounded int - the
@@ -414,8 +488,6 @@ class ConfigConstants:
         "arrow_font_size": {"type": int, "default": DEFAULT_ARROW_FONT_SIZE, "min": fonts.FONT_SIZE_MIN, "max": fonts.FONT_SIZE_MAX},
         "arrow_font_weight": {"type": int, "default": DEFAULT_ARROW_FONT_WEIGHT, "min": 1, "max": 1000},
         "use_custom_arrow_colors": {"type": bool, "default": DEFAULT_USE_CUSTOM_ARROW_COLORS},
-        "arrow_up_color": {"type": str, "default": DEFAULT_ARROW_UP_COLOR, "regex": r"#[0-9a-fA-F]{6}"},
-        "arrow_down_color": {"type": str, "default": DEFAULT_ARROW_DOWN_COLOR, "regex": r"#[0-9a-fA-F]{6}"},
         "arrow_up_symbol": {"type": str, "default": ""},
         "arrow_down_symbol": {"type": str, "default": ""},
         "free_move": {"type": bool, "default": DEFAULT_FREE_MOVE},
@@ -427,6 +499,7 @@ class ConfigConstants:
         "cpu_label_color": {"type": str, "default": DEFAULT_CPU_LABEL_COLOR, "regex": r"#[0-9a-fA-F]{6}"},
         "gpu_label_color": {"type": str, "default": DEFAULT_GPU_LABEL_COLOR, "regex": r"#[0-9a-fA-F]{6}"},
         "keep_visible_fullscreen": {"type": bool, "default": DEFAULT_KEEP_VISIBLE_FULLSCREEN},
+        "hide_when_apps_cover": {"type": bool, "default": DEFAULT_HIDE_WHEN_APPS_COVER},
         "force_decimals": {"type": bool, "default": DEFAULT_FORCE_DECIMALS},
         "unit_type": {"type": str, "default": DEFAULT_UNIT_TYPE, "choices": ["bits_decimal", "bits_binary", "bytes_decimal", "bytes_binary"]},
         "swap_upload_download": {"type": bool, "default": DEFAULT_SWAP_UPLOAD_DOWNLOAD},
@@ -493,6 +566,8 @@ class ConfigConstants:
         "location_onboarding_dismissed": {"type": bool, "default": False},
         "widgets_overlap_nudge_shown": {"type": bool, "default": False},
         "side_bar_no_room_notice_shown": {"type": bool, "default": False},
+        "app_overlap_notice_shown": {"type": bool, "default": False},
+        "app_overlap_drop_offset": {"type": (int, type(None)), "default": None},
         "cpu_load_high_threshold": {"type": (int, float), "default": DEFAULT_CPU_LOAD_HIGH_THRESHOLD, "min": 0, "max": 100},
         "cpu_load_low_threshold": {"type": (int, float), "default": DEFAULT_CPU_LOAD_LOW_THRESHOLD, "min": 0, "max": 100},
         "gpu_load_high_threshold": {"type": (int, float), "default": DEFAULT_GPU_LOAD_HIGH_THRESHOLD, "min": 0, "max": 100},
@@ -509,6 +584,7 @@ class ConfigConstants:
         # QScreen.name() identifier (e.g. "\\.\DISPLAY1"). None = use primary.
         # If the saved screen isn't found at runtime, fall back to primary.
         "preferred_monitor": {"type": (str, type(None)), "default": None},
+        "show_on_all_taskbars": {"type": bool, "default": DEFAULT_SHOW_ON_ALL_TASKBARS},
         # --- Data-usage / data-cap ---
         "data_cap_enabled": {"type": bool, "default": False},
         "data_cap_gb": {"type": (int, float), "default": 0.0, "min": 0.0, "max": 1_000_000.0},
@@ -520,6 +596,12 @@ class ConfigConstants:
         "metrics_endpoint_port": {"type": int, "default": network.metrics.DEFAULT_PORT,
                                   "min": network.metrics.MIN_PORT, "max": network.metrics.MAX_PORT},
     }
+    # One #RRGGBB rule per themed colour key, so a bad hand edit resets that key, not the scheme.
+    for _stem, _pair in THEMED_COLOR_DEFAULTS.items():
+        for _i, _suffix in enumerate(THEME_SUFFIXES):
+            VALIDATION_SCHEMA[f"{_stem}_{_suffix}"] = {"type": str, "default": _pair[_i],
+                                                       "regex": r"#[0-9a-fA-F]{6}"}
+    del _stem, _pair, _i, _suffix
 
 
     def __init__(self) -> None:
