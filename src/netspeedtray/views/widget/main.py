@@ -112,6 +112,11 @@ try:
     _WM_NST_SHUTDOWN = shutdown_channel.shutdown_message_id()
 except Exception:
     _WM_NST_SHUTDOWN = 0
+# A second launch's "show yourself" (#234, rc.2 W14) - same channel, same 0 guard.
+try:
+    _WM_NST_ACTIVATE = shutdown_channel.activate_message_id()
+except Exception:
+    _WM_NST_ACTIVATE = 0
 
 
 # double_click_action -> the i18n key of its Settings label (the same words the user picked it by).
@@ -249,6 +254,7 @@ class NetworkSpeedWidget(QWidget):
         self._is_context_menu_visible: bool = False
         self.last_tray_rect: Optional[Tuple[int, int, int, int]] = None
         self._taskbar_lost_count: int = 0
+        self._no_taskbar_ticks: int = 0   # consecutive refreshes holding for a missing taskbar (W5)
         self._will_quit_app: bool = False # Flag to distinguish hide vs exit
         self._shutdown_armed_hwnd: int = 0  # HWND the --shutdown channel was armed on
         
@@ -400,8 +406,10 @@ class NetworkSpeedWidget(QWidget):
             self.layout_manager.init_font()
 
         try:
-            # Position Manager
-            taskbar_info = get_taskbar_info()
+            # Position Manager. The widget's OWN taskbar from the start (preferred monitor, #72): a bare
+            # get_taskbar_info() seeded the primary's, which the owner fallback and every read of
+            # _state.taskbar_info before the first refresh then used (rc.2 W12).
+            taskbar_info = get_taskbar_info(preferred_screen_name=self.config.get("preferred_monitor"))
             window_state = WindowState(
                 config=self.config,
                 widget=self,
@@ -409,6 +417,7 @@ class NetworkSpeedWidget(QWidget):
                 font_metrics=self.current_metrics
             )
             self.position_manager = PositionManager(window_state, parent=self)
+            self.position_manager.on_side_no_room = self._maybe_show_side_no_room_notice
             # Note: InputHandler is initialized in _init_ui_components() after tray_manager is created
             
             self.logger.debug("Managers initialized successfully.")
@@ -480,6 +489,21 @@ class NetworkSpeedWidget(QWidget):
             # #188: is the preferred monitor a taskbar-less display we should free-float on?
             free_float_active = self.position_manager.refresh_float_state() is not None
 
+            # No taskbar at all (Explorer restarting, rc.2 W5): hide and keep the last position until
+            # the new taskbar exists, rather than float at the screen-fallback spot. Bounded - past
+            # TASKBAR_ABSENT_HOLD_MS the old fallback applies. `is True`: a mocked manager is not.
+            # Debounced (#440 review L5): the first no-taskbar tick only holds the position; the widget
+            # hides from the second consecutive one, so one transient failed lookup can't flicker it.
+            if not free_float_active and self.position_manager.holding_for_taskbar(taskbar_info) is True:
+                ticks = getattr(self, "_no_taskbar_ticks", 0)
+                ticks = (ticks if isinstance(ticks, int) else 0) + 1
+                self._no_taskbar_ticks = ticks
+                if ticks >= constants.timeouts.TASKBAR_ABSENT_HIDE_AFTER_TICKS and self.isVisible():
+                    self.dismiss_hover_card()
+                    self.setVisible(False)
+                return
+            self._no_taskbar_ticks = 0
+
             # Allow user override to keep widget visible even when a fullscreen window is present
             keep_visible = self.config.get("keep_visible_fullscreen", False)
             if free_float_active:
@@ -503,6 +527,8 @@ class NetworkSpeedWidget(QWidget):
                     # _float_refreshed=True: we already called refresh_float_state() above for the
                     # visibility check this tick, so don't re-enumerate taskbars inside (#188).
                     self.position_manager.update_position(fresh_taskbar_info=taskbar_info, _float_refreshed=True)
+                    # Side bars: the icon alignment and the bounded "apps near the widget" re-check.
+                    self.position_manager.side_bar_tick()
                 
                 # Always re-assert topmost status when visible to prevent falling behind taskbar (#77)
                 self._ensure_win32_topmost()
@@ -963,6 +989,28 @@ class NetworkSpeedWidget(QWidget):
     # _load_initial_config removed as it is now handled by ConfigController class
 
 
+    def _on_taskbar_alignment_changed(self) -> None:
+        """WM_SETTINGCHANGE saw TaskbarAl flip (rc.1 B3). On build 26200 this broadcast never arrives,
+        so the side-bar watcher also reads the value on its own hook and on the 1 s tick; this is
+        one more hint. The watcher re-decides once the re-laid bar has settled."""
+        pm = getattr(self, "position_manager", None)
+        if pm is None:
+            return
+        try:
+            pm.note_taskbar_alignment_hint()
+        except Exception as e:
+            self.logger.debug("alignment change handling failed: %s", e)
+
+    def _on_foreground_for_side_bar(self, _hwnd: int = 0) -> None:
+        """A new foreground window often means a new app button on the taskbar (side-bar watcher)."""
+        pm = getattr(self, "position_manager", None)
+        if pm is None or self.config.get("free_move", False):
+            return
+        try:
+            pm.note_foreground_change()
+        except Exception as e:
+            self.logger.debug("side-bar foreground hint failed: %s", e)
+
     def _on_theme_changed(self) -> None:
         """Delegates theme change handling."""
         # An open card (pinned ones last for minutes) keeps the old theme's colours: close it; the
@@ -1043,9 +1091,11 @@ class NetworkSpeedWidget(QWidget):
             # 1. System Event Handler (replaces manual WinEventHooks)
             self.system_event_handler.foreground_app_changed.connect(self._execute_refresh)
             self.system_event_handler.foreground_app_changed.connect(self._on_foreground_for_hover_card)
+            self.system_event_handler.foreground_app_changed.connect(self._on_foreground_for_side_bar)
             self.system_event_handler.taskbar_changed.connect(self.update_position)
             self._refresh_cached_layout_mode()
             self.system_event_handler.theme_changed.connect(self._on_theme_changed)
+            self.system_event_handler.taskbar_alignment_changed.connect(self._on_taskbar_alignment_changed)
             
             # Emergency-hide on unambiguous fullscreen - but honor the user's
             # "keep visible over fullscreen" choice (issue #107). Without this guard
@@ -2038,6 +2088,10 @@ class NetworkSpeedWidget(QWidget):
                     self.logger.info("Shutdown requested by another process (installer/--shutdown) - exiting cleanly.")
                     QTimer.singleShot(0, self.fully_exit_application)
                     return True, 0
+                if _WM_NST_ACTIVATE and msg.message == _WM_NST_ACTIVATE:
+                    # A second launch (#234): deferred out of the native dispatch like the shutdown.
+                    QTimer.singleShot(0, self.show_from_second_launch)
+                    return True, 0
                 if msg.message == _WM_QUERYENDSESSION or (msg.message == _WM_ENDSESSION and msg.wParam):
                     # Logoff / shutdown / restart. The normal quit path (closeEvent -> cleanup) never
                     # runs: Windows terminates us soon after WM_ENDSESSION returns, so the essential
@@ -2115,8 +2169,8 @@ class NetworkSpeedWidget(QWidget):
         self.position_manager.enforce_topmost_status()
 
     def reset_to_default_position(self) -> None:
-        """Right-click > Reset position: back to the automatic spot by the tray - clears the
-        free-move spot AND the docked drag offsets, then re-places."""
+        """Right-click > Reset position: back to the automatic spot by the tray (or the side bar's
+        chosen gap) - clears the free-move spot AND the docked drag offsets, then re-places."""
         self.logger.info("Resetting widget position to default.")
         self._hide_usage_hover_card()
         defaults = constants.config.defaults
@@ -2126,15 +2180,114 @@ class NetworkSpeedWidget(QWidget):
                             'tray_offset_x': defaults.DEFAULT_TRAY_OFFSET_X,
                             'tray_offset_y': defaults.DEFAULT_TRAY_OFFSET_Y})
 
+    def show_from_second_launch(self) -> None:
+        """
+        The app was launched again while running (#234, rc.2 W14; the second process posts
+        ACTIVATE_MESSAGE_NAME and exits). Bring the widget back however it was lost: hidden -> shown;
+        re-placed and re-docked to the current taskbar; still off-screen -> the docked spot for this
+        session (nothing saved is cleared); re-seated above the taskbar if it was buried, with the
+        burial backoff forgotten so nothing defers it. The 1 s refresh then applies the usual rules
+        (an auto-hidden taskbar still hides it). A fullscreen app keeps it hidden, as always - unless
+        Keep visible in fullscreen is on. Never opens a window: a duplicate Run-key start at sign-in
+        must stay invisible.
+        """
+        try:
+            pm = getattr(self, "position_manager", None)
+            if pm is None:
+                return
+            self.logger.info("Another launch asked the widget to show itself (visible=%s).", self.isVisible())
+            handler = getattr(self, "system_event_handler", None)
+            if (handler is not None and handler.is_fullscreen_active()
+                    and not self.config.get("keep_visible_fullscreen", False)):
+                self.logger.info("A fullscreen app is active - the widget comes back when it ends.")
+                return
+            self._taskbar_lost_count = 0
+            if not self.isVisible():
+                self.setVisible(True)
+            pm.reset_reseat_state()
+            pm.update_position()   # a saved spot on a monitor that is gone already falls back here
+            if self._is_off_screen():
+                # Still nowhere visible: the docked spot for THIS session only. Nothing saved is
+                # cleared - a duplicate start at sign-in can beat a slow monitor that holds the
+                # saved Free Move spot (#440 review L3); Reset position stays the explicit choice.
+                self.logger.info("The widget was off-screen - showing it at its docked spot for now.")
+                pm.move_to_default_for_session()
+            pm.ensure_topmost()
+            if pm.is_buried_behind_taskbar():
+                pm.reseat_above_taskbar()
+            QTimer.singleShot(0, self._execute_refresh)
+        except Exception as e:
+            self.logger.error("Bringing the widget back for a second launch failed: %s", e, exc_info=True)
+
+    def _is_off_screen(self) -> bool:
+        """True when the widget's centre is on no connected screen (e.g. a saved spot on an unplugged
+        monitor, or a stray position from elsewhere)."""
+        try:
+            return QApplication.screenAt(self.frameGeometry().center()) is None
+        except Exception:
+            return False
+
     def has_custom_position(self) -> bool:
         """Whether the widget sits where the user put it (a drag, or a saved free-move spot) - the
         tray menu offers Reset position only then."""
         defaults = constants.config.defaults
         cfg = self.config or {}
+        offset_x = cfg.get('tray_offset_x', defaults.DEFAULT_TRAY_OFFSET_X)
+        # An older release's default offset (10 / 1 / 3) is not a move the user made (rc.2 W6).
+        default_x = offset_x == defaults.DEFAULT_TRAY_OFFSET_X or offset_x in defaults.LEGACY_DEFAULT_TRAY_OFFSETS_X
         return (cfg.get('position_x') is not None or cfg.get('position_y') is not None
-                or cfg.get('tray_offset_x', defaults.DEFAULT_TRAY_OFFSET_X) != defaults.DEFAULT_TRAY_OFFSET_X
+                or not default_x
                 or cfg.get('tray_offset_y', defaults.DEFAULT_TRAY_OFFSET_Y) != defaults.DEFAULT_TRAY_OFFSET_Y)
 
+    def _maybe_show_side_no_room_notice(self) -> None:
+        """One-time heads-up (ever): a side taskbar's app buttons leave no free spot, so the widget sits
+        by the tray and may cover some of them - it can be dragged anywhere along the bar. Called by
+        PositionManager when its placement ends in "tray_no_room" (never while the user's own drag
+        is in force)."""
+        try:
+            if getattr(self, "_side_no_room_shown", False) or self.config.get("side_bar_no_room_notice_shown", False):
+                return
+            self._side_no_room_shown = True
+            self.update_config({"side_bar_no_room_notice_shown": True})
+            title = self.i18n.SIDE_BAR_NO_ROOM_TITLE
+            body = self.i18n.SIDE_BAR_NO_ROOM_BODY
+            # Deferred out of the reposition. A non-activating flyout, NOT a QMessageBox: this can fire
+            # while the user types in another app (apps opened after placement, rc.2 W1), and a modal
+            # message box took the keyboard away from it (rc.1 live test, W4).
+            QTimer.singleShot(0, lambda: self._show_notice_flyout(title, body))
+        except Exception as e:
+            self.logger.debug("side-bar no-room notice failed: %s", e)
+
+    # The no-room notice is longer than a usage alert: give it time to be read.
+    _NOTICE_FLYOUT_DISMISS_MS = 30000
+
+    def _show_notice_flyout(self, title: str, body: str, action_text: Optional[str] = None,
+                            on_action=None) -> None:
+        """A one-time notice next to the widget that never takes focus (the data-cap alerts' flyout).
+        ``action_text`` / ``on_action``: an optional button (e.g. "Open folder")."""
+        try:
+            from netspeedtray.views.flyout import Flyout
+            from PyQt6 import sip
+            previous = getattr(self, "_notice_flyout", None)
+            if previous is not None and not sip.isdeleted(previous):
+                previous.close()
+            self._notice_flyout = Flyout(title, body, action_text=action_text if on_action else None,
+                                         auto_dismiss_ms=self._NOTICE_FLYOUT_DISMISS_MS)
+            if on_action is not None and action_text:
+                self._notice_flyout.action_clicked.connect(on_action)
+            geo = self.frameGeometry()
+            self._notice_flyout.show_at(QPoint(geo.left(), geo.top()))
+        except Exception as e:
+            self.logger.error("Error showing a notice: %s", e, exc_info=True)
+
+
+    def show_backup_notice(self, title: str, body: str, path: Optional[str] = None) -> None:
+        """Settings > Advanced > Back up history finished while Settings was closed (#334): say so in the
+        non-focus flyout, with "Open folder" when a copy was written - never a modal box with no visible
+        parent, which would take focus and block the Monitor."""
+        from netspeedtray.utils.helpers import reveal_in_explorer
+        self._show_notice_flyout(title, body, action_text=self.i18n.STATS_DETAIL_OPEN_FOLDER if path else None,
+                                 on_action=(lambda: reveal_in_explorer(path)) if path else None)
 
     def apply_all_settings(self) -> None:
         """Delegates to ConfigController."""
@@ -2366,7 +2519,9 @@ class NetworkSpeedWidget(QWidget):
             from netspeedtray.views.temp_onboarding_dialog import (
                 TempOnboardingDialog, LHM_RELEASES_URL,
             )
-            dlg = TempOnboardingDialog(self.i18n, self)
+            # The port the user configured for LHM (Settings > Hardware), as the hint names it.
+            lhm_port = getattr(self.monitor_thread, "lhm_port", constants.lhm.HTTP_PORT)
+            dlg = TempOnboardingDialog(self.i18n, self, lhm_port=lhm_port)
             dlg.exec()
             if dlg.dismissed_forever():
                 self.update_config({"temp_onboarding_dismissed": True})
@@ -2719,6 +2874,7 @@ class NetworkSpeedWidget(QWidget):
         def _position_manager() -> None:
             if getattr(self, 'position_manager', None):
                 self.position_manager.stop_monitoring()
+                self.position_manager.stop_side_watcher()
 
         def _state_watcher() -> None:
             timer = getattr(self, '_state_watcher_timer', None)
@@ -2772,6 +2928,13 @@ class NetworkSpeedWidget(QWidget):
         def _position_config() -> None:
             self._capture_position_config()
 
+        def _history_backup() -> None:
+            # A running Settings > Advanced > Back up history (#334): interrupt its copy and give its
+            # thread a moment to delete the unfinished file + -journal. It only ever reads the live
+            # file, so a thread still running after the wait loses nothing (it is a daemon thread).
+            from netspeedtray.core.db import history_backup
+            history_backup.cancel_all(constants.timeouts.HISTORY_BACKUP_CANCEL_WAIT_MS / 1000.0)
+
         def _config_save() -> None:
             self.logger.debug("Performing final configuration save...")
             self.config_manager.save(self.config)
@@ -2785,7 +2948,7 @@ class NetworkSpeedWidget(QWidget):
         steps = (
             ("hover card", _hover_card), ("event hooks", _event_hooks),
             ("position manager", _position_manager), ("state watcher", _state_watcher),
-            ("monitor window", _monitor_window),
+            ("monitor window", _monitor_window), ("history backup", _history_backup),
             ("monitor thread", _monitor_thread), ("latency probe", _latency_probe),
             ("update checker", _update_checker),
             ("metrics endpoint", _metrics_endpoint), ("controller", _controller),

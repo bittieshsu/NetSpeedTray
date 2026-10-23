@@ -77,7 +77,11 @@ class _NoLhmWebServer:
     """Stand-in for LhmHttpClient: LibreHardwareMonitor's web server is not running."""
 
     def __init__(self, *args, **kwargs):
+        from netspeedtray import constants
         self.calls = 0
+        self.host = constants.lhm.HTTP_HOST
+        self.port = constants.lhm.HTTP_PORT
+        self.status = constants.lhm.STATUS_NOT_FOUND
 
     def get_snapshot(self):
         self.calls += 1
@@ -85,6 +89,9 @@ class _NoLhmWebServer:
 
     def reset_backoff(self):
         pass
+
+    def configure(self, port, username="", password=""):
+        self.port = port
 
 
 @pytest.fixture(autouse=True)
@@ -96,6 +103,15 @@ def _no_real_lhm_web_server(monkeypatch):
     reading set ``thread._lhm_http`` themselves."""
     from netspeedtray.core import monitor_thread
     monkeypatch.setattr(monitor_thread, "LhmHttpClient", _NoLhmWebServer)
+
+
+@pytest.fixture(autouse=True)
+def _backups_not_quitting(monkeypatch):
+    """A widget ``cleanup()`` under test calls ``history_backup.cancel_all`` (the app is quitting), which
+    refuses every later backup for the rest of the process - right for the app, wrong for the next
+    test (#334). Each test starts with backups allowed."""
+    from netspeedtray.core.db import history_backup
+    monkeypatch.setattr(history_backup, "_cancelled", False)
 
 
 @pytest.fixture(autouse=True)

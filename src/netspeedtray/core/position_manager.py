@@ -11,7 +11,7 @@ This module consolidates all widget positioning logic, including:
 import logging
 from dataclasses import dataclass
 from collections import deque
-from typing import Optional, Tuple, List, Protocol, runtime_checkable, Dict, Any, Deque, TYPE_CHECKING
+from typing import Optional, Tuple, List, Protocol, runtime_checkable, Dict, Any, Callable, Deque, TYPE_CHECKING
 import math
 import time
 import ctypes
@@ -147,6 +147,8 @@ _BURIAL_FIGHT_WINDOW_S = constants.timeouts.BURIAL_FIGHT_WINDOW_MS / 1000.0
 # ... unless fresh burials come faster than a person can cause them (rationale with the constants).
 _BURIAL_FRESH_RATE_MAX = constants.timeouts.BURIAL_FRESH_RATE_MAX
 _BURIAL_FRESH_RATE_WINDOW_S = constants.timeouts.BURIAL_FRESH_RATE_WINDOW_MS / 1000.0
+# A recovery this close to a dock / tray change logs at DEBUG and keeps the INFO line (rc.2 W8).
+_BURIAL_LOG_SETTLE_S = constants.timeouts.BURIAL_LOG_SETTLE_MS / 1000.0
 _ERROR_ACCESS_DENIED = 5
 # The on-top stretch must be OBSERVED: checks run at least once a second while the widget is
 # shown, so a longer gap between two verified on-top checks (the widget was hidden, or nothing
@@ -198,6 +200,154 @@ class WindowState:
     widget: PositionAwareProtocol
     taskbar_info: Optional[TaskbarInfo] = None
     font_metrics: Optional[QFontMetrics] = None
+
+
+@dataclass(frozen=True, slots=True)
+class SideBarGeometry:
+    """A native side taskbar's spans along its length, logical px (bottoms exclusive).
+
+    ``apps_*`` is the app-button group (Start .. last app, plus every other non-tray button such as the
+    "..." overflow), None when unknown; ``limit_top`` is where a widget may start - below the Widgets
+    button when there is one at the top, else the bar's top. ``end_top`` is where the tray END starts
+    for placement: the tray's top, or - "Top" icon alignment, where Win11 moves the Widgets button down
+    beside the tray - the Widgets button's top (rc.1 live test B4). ``tray_top`` stays the tray itself:
+    a user's drag offset (``tray_offset_y``) is measured from it."""
+    bar_top: float
+    tray_top: float
+    limit_top: float
+    apps_top: Optional[float]
+    apps_bottom: Optional[float]
+    end_top: Optional[float] = None
+    # The "..." overflow button's span (rc.2 L2): the only way to reach the apps Win11 hides on a
+    # full bar, so a no-room widget never covers it. None when there is none / it is unknown.
+    overflow_top: Optional[float] = None
+    overflow_bottom: Optional[float] = None
+
+    @property
+    def end(self) -> float:
+        return self.tray_top if self.end_top is None else self.end_top
+
+
+@dataclass(frozen=True, slots=True)
+class SidePlacement:
+    """Where the automatic side-bar placement put the widget (decided rarely - see PositionManager).
+
+    ``mode``: "tray" (tray end, the default), "top" (the gap between the Widgets button / bar top and
+    the first app) or "tray_no_room" (tray end although the apps reach it - the user gets a one-time
+    "you can drag it" heads-up). ``y`` is the absolute logical y for "top", else None."""
+    mode: str
+    y: Optional[int] = None
+
+
+_FROM_INFO = object()
+
+
+def side_bar_geometry(taskbar_info: TaskbarInfo, dpi_scale: float, *, apps: Any = _FROM_INFO,
+                      widgets: Any = _FROM_INFO, overflow: Any = None) -> Optional[SideBarGeometry]:
+    """The spans the side-bar placement and drag limits work from, or None when this is not a NATIVE
+    side bar we own the rules for: a bar with a real ``ToolbarWindow32`` task list (ExplorerPatcher,
+    Win10-style) keeps today's tasklist-based behaviour unchanged.
+
+    ``apps`` / ``widgets`` override the TaskbarInfo's ``apps_extent`` / ``widgets_extent`` (the
+    placement decision passes one consistent probe snapshot instead of fields read at another time)."""
+    if taskbar_utils.valid_rect(getattr(taskbar_info, "tasklist_rect", None)) is not None:
+        return None
+    rect = taskbar_utils.valid_rect(getattr(taskbar_info, "rect", None))
+    screen = taskbar_info.get_screen()
+    if screen is None:
+        return None
+    scale = dpi_scale if dpi_scale and dpi_scale > 0 else 1.0
+    full = screen.geometry()
+    bar_top = rect[1] / scale if rect else float(full.top())
+    bar_bottom = rect[3] / scale if rect else float(full.bottom() + 1)
+    tray = taskbar_utils.valid_rect(taskbar_info.get_tray_rect())
+    tray_top = tray[1] / scale if tray else bar_bottom
+
+    if apps is _FROM_INFO:
+        apps = getattr(taskbar_info, "apps_extent", None)
+    apps = taskbar_utils.valid_rect(apps)
+    apps_top = apps[1] / scale if apps else None
+    apps_bottom = apps[3] / scale if apps else None
+
+    # Never park the widget on the Widgets button. With Center alignment it sits at the TOP of a side
+    # bar (above Start): the widget may start below it. With "Top" alignment Win11 moves it down to
+    # just above the tray (owner's PC 2026-10-22: y 852-896, tray from ~900): it then belongs to the
+    # tray end, and the widget goes above it. Prefer the layout probe's full button box, else the
+    # #200 probe's content rect.
+    limit_top = bar_top
+    end_top = None
+    if widgets is _FROM_INFO:
+        widgets = getattr(taskbar_info, "widgets_extent", None)
+    widgets = (taskbar_utils.valid_rect(widgets)
+               or taskbar_utils.valid_rect(getattr(taskbar_info, "widgets_rect", None)))
+    if widgets is not None:
+        w_top, w_bottom = widgets[1] / scale, widgets[3] / scale
+        if apps_top is not None and apps_bottom is not None:
+            above = w_bottom <= apps_top
+            below = w_top >= apps_bottom
+        else:                                   # apps unknown: whichever half of the bar it is in
+            middle = (w_top + w_bottom) / 2.0
+            above = middle < (bar_top + tray_top) / 2.0
+            below = not above
+        if above and bar_top <= w_bottom <= tray_top:
+            limit_top = w_bottom
+        elif below and bar_top <= w_top < tray_top:
+            end_top = w_top
+    overflow = taskbar_utils.valid_rect(overflow)
+    return SideBarGeometry(bar_top=bar_top, tray_top=tray_top, limit_top=limit_top,
+                           apps_top=apps_top, apps_bottom=apps_bottom, end_top=end_top,
+                           overflow_top=overflow[1] / scale if overflow else None,
+                           overflow_bottom=overflow[3] / scale if overflow else None)
+
+
+def side_bar_y_limits(geo: SideBarGeometry, widget_height: int) -> Tuple[int, int]:
+    """``(y_min, y_max)`` a side-bar widget may sit at: from below the Widgets button (or the bar
+    top) down to the tray end (the tray, or a Widgets button beside it) minus the #161 gap. When the
+    widget can't fit between the two, both are the tray-end y (never above the bar top)."""
+    gap = constants.layout.TRAY_EDGE_MIN_GAP_PX
+    y_max = math.floor(geo.end - gap - widget_height)
+    y_min = math.ceil(geo.limit_top)
+    if y_max < y_min:
+        y_max = max(y_max, math.ceil(geo.bar_top))
+        return y_max, y_max
+    return y_min, y_max
+
+
+def choose_side_placement(geo: SideBarGeometry, widget_height: int) -> SidePlacement:
+    """The side-bar placement rule (side-taskbar design §3):
+
+    1. tray end, when the gap between the last app and the tray fits the widget (or the apps'
+       extent is unknown - today's behaviour);
+    2. else the top gap, between the Widgets button (or the bar top) and the first app, centred;
+    3. else tray end anyway, flagged so the user is told once that they can drag it - but never on
+       the "..." overflow button (rc.2 L2): when the tray-end spot would cover it, the widget goes
+       just above it instead (covering an app button, which "..." still reaches).
+    """
+    clearance = constants.layout.DEFAULT_PADDING
+    y_min, y_max = side_bar_y_limits(geo, widget_height)
+    if geo.apps_top is None or geo.apps_bottom is None:
+        return SidePlacement("tray")
+    if geo.apps_bottom + clearance <= y_max:
+        return SidePlacement("tray")
+    room = geo.apps_top - geo.limit_top
+    if room >= widget_height + 2 * clearance:
+        y = round(geo.limit_top + (room - widget_height) / 2.0)
+        return SidePlacement("top", max(y_min, min(y, y_max)))
+    y = y_max
+    if (geo.overflow_top is not None and geo.overflow_bottom is not None
+            and y < geo.overflow_bottom and y + widget_height > geo.overflow_top):
+        y = max(y_min, math.floor(geo.overflow_top - widget_height))
+        return SidePlacement("tray_no_room", y)
+    return SidePlacement("tray_no_room")
+
+
+def user_placed_side_offset(config: Dict[str, Any]) -> bool:
+    """True when the user dragged the widget along a side bar: the drag saves ``tray_offset_y``, and a
+    side-bar drag can't produce the default (the drag limit keeps it >= TRAY_EDGE_MIN_GAP_PX, above
+    the default 3). Reset position puts the default back. The user's drag always wins."""
+    default = constants.config.defaults.DEFAULT_TRAY_OFFSET_Y
+    value = config.get('tray_offset_y', default)
+    return isinstance(value, int) and not isinstance(value, bool) and value != default
 
 
 class ScreenUtils:
@@ -259,14 +409,16 @@ class PositionCalculator:
     def __init__(self) -> None:
         self._last_drag_log_time: float = 0.0
 
-    def calculate_position(self, taskbar_info: TaskbarInfo, widget_size: Tuple[int, int], config: Dict[str, Any]) -> ScreenPosition:
+    def calculate_position(self, taskbar_info: TaskbarInfo, widget_size: Tuple[int, int], config: Dict[str, Any],
+                           side_placement: Optional[SidePlacement] = None) -> ScreenPosition:
         """
         Calculates the widget's optimal position based on taskbar edge and tray location.
-        
+
         Args:
             taskbar_info: TaskbarInfo object with position/edge information
             widget_size: Tuple of (width, height) in pixels
             config: Configuration dictionary with positioning options
+            side_placement: the automatic side-bar placement PositionManager decided (None = tray end)
             
         Returns:
             ScreenPosition with calculated x, y coordinates
@@ -331,7 +483,8 @@ class PositionCalculator:
                 x, y = self._calculate_horizontal_position(taskbar_info, widget_size, config, dpi_scale)
             elif edge in (constants.taskbar.edge.LEFT, constants.taskbar.edge.RIGHT):
                 # Vertical taskbar: calculate X position (centered in taskbar gap)
-                x, y = self._calculate_vertical_position(taskbar_info, widget_size, config, dpi_scale)
+                x, y = self._calculate_vertical_position(taskbar_info, widget_size, config, dpi_scale,
+                                                         side_placement)
             else:
                 return self._get_safe_fallback_position(widget_size)
 
@@ -388,6 +541,11 @@ class PositionCalculator:
             # the show-hidden-icons "^" chevron and steals its clicks (#161 pt1).
             right_boundary = round(tray_rect[0] / dpi_scale)
             offset = max(offset, constants.layout.TRAY_EDGE_MIN_GAP_PX)
+            # Classic toolbars (Desktop / Links, Win10) between the apps and the tray: hug their left
+            # edge instead of drawing over them (#324, best-effort). Always None on Win11.
+            toolbars = taskbar_utils.valid_rect(getattr(taskbar_info, "toolbars_rect", None))
+            if toolbars is not None and toolbars[0] < tray_rect[0]:
+                right_boundary = round(toolbars[0] / dpi_scale)
         else:
             # A Win11 SECONDARY taskbar (Shell_SecondaryTrayWnd) has no TrayNotifyWnd child, so
             # get_tray_rect() is None. Its clock is shell-drawn with no HWND to hug; reserve an
@@ -443,7 +601,8 @@ class PositionCalculator:
         return round(x_origin + (strip_width - widget_width) / 2.0)
 
     def _calculate_vertical_position(self, taskbar_info: TaskbarInfo, widget_size: Tuple[int, int],
-                                     config: Dict[str, Any], dpi_scale: float) -> Tuple[int, int]:
+                                     config: Dict[str, Any], dpi_scale: float,
+                                     side_placement: Optional[SidePlacement] = None) -> Tuple[int, int]:
         """
         Calculate position for vertical (left/right) taskbar.
         
@@ -471,11 +630,31 @@ class PositionCalculator:
         x_origin, visible_tb_width = vertical_taskbar_strip(taskbar_info, edge, dpi_scale)
         x = self._centre_in_strip(widget_width, x_origin, visible_tb_width)
         
+        offset_y = config.get('tray_offset_y', constants.config.defaults.DEFAULT_TRAY_OFFSET_Y)
+
+        # A native Win11 side bar (no ToolbarWindow32): the Phase B rules - the automatic placement
+        # unless the user dragged it, and either way clamped to the bar (so a stale offset saved on
+        # another layout can't park it on the Widgets button or off the bar).
+        geo = side_bar_geometry(taskbar_info, dpi_scale)
+        if geo is not None:
+            y_min, y_max = side_bar_y_limits(geo, widget_height)
+            if user_placed_side_offset(config):
+                y = round(geo.tray_top - widget_height - offset_y)
+            elif (side_placement is not None and side_placement.mode in ("top", "tray_no_room")
+                  and side_placement.y is not None):
+                y = side_placement.y
+            else:
+                y = y_max                       # tray end, #161 gap
+            return x, max(y_min, min(y, y_max))
+
         # Calculate Y: align to bottom (system tray side) with offset.
         tray_rect = taskbar_info.get_tray_rect()
         bottom_boundary = round(tray_rect[1] / dpi_scale) if tray_rect else (full_geom.bottom() + 1)
+        # Classic toolbars above the tray on a Win10 side bar (#324, best-effort): sit above them.
+        toolbars = taskbar_utils.valid_rect(getattr(taskbar_info, "toolbars_rect", None))
+        if tray_rect and toolbars is not None and toolbars[1] < tray_rect[1]:
+            bottom_boundary = round(toolbars[1] / dpi_scale)
 
-        offset_y = config.get('tray_offset_y', constants.config.defaults.DEFAULT_TRAY_OFFSET_Y)
         y = round(bottom_boundary - widget_height - offset_y)
 
         # Safety check: avoid overlapping top-side icons on vertical taskbars.
@@ -555,7 +734,14 @@ class PositionCalculator:
                 # Vertical Constraint - the same strip as the auto-placement and the width.
                 strip_x, strip_w = vertical_taskbar_strip(taskbar_info, edge, dpi_scale)
                 fixed_x = self._centre_in_strip(widget_width, strip_x, strip_w)
-                
+
+                # Native Win11 side bar: from below the Widgets button (or the bar top) to the tray
+                # top minus the #161 gap - the same limits the placement clamps to.
+                geo = side_bar_geometry(taskbar_info, dpi_scale)
+                if geo is not None:
+                    y_min, y_max = side_bar_y_limits(geo, widget_height)
+                    return QPoint(fixed_x, max(y_min, min(desired_pos.y(), y_max)))
+
                 # Keep within the safe zone, but allow bottom-alignment as calculated choice
                 bottom_boundary = (round(taskbar_info.get_tray_rect()[1] / dpi_scale) - widget_height - constants.layout.DEFAULT_PADDING) if taskbar_info.get_tray_rect() else (screen.geometry().bottom() - widget_height)
                 top_boundary = (round(taskbar_info.tasklist_rect[3] / dpi_scale) + constants.layout.DEFAULT_PADDING) if taskbar_info.tasklist_rect else screen.geometry().top()
@@ -594,6 +780,13 @@ class PositionManager(QObject):
         self._reseat_attempts: int = 0
         self._last_reseat_ts: float = 0.0
         self._first_recovery_logged: bool = False
+        # rc.2 W8: when the widget last docked (owner set) or saw the tray rect change, and when the
+        # INFO recovery line was logged - see _log_recovery / note_layout_settle. 0.0 = never.
+        self._layout_settle_ts: float = 0.0
+        self._recovery_info_ts: float = 0.0
+        self._last_seen_tray: Optional[tuple] = None
+        self._last_dock_owner: int = 0   # taskbar HWND of the last dock that started a settle window
+        self._owner_set_to: int = 0      # taskbar HWND _ensure_taskbar_owner last set as the owner
         # Start of the current continuous on-top stretch (is_buried_behind_taskbar);
         # None while we have not verified we are on top. Gates backoff retirement.
         self._on_top_since: Optional[float] = None
@@ -621,9 +814,41 @@ class PositionManager(QObject):
         self._access_denied_logged: bool = False
         # One INFO line per stretch of a not-ready tray rect (see _tray_rect_ready).
         self._tray_not_ready_logged: bool = False
+        # No taskbar at all (Explorer restarting, rc.2 W5) - see holding_for_taskbar.
+        self._had_real_taskbar: bool = False
+        self._taskbar_absent_since: Optional[float] = None
+        self._taskbar_hold_expired_logged: bool = False
         # Last good tray rect per (monitor, edge), as offsets from the taskbar's right/bottom.
         self._last_good_tray: Dict[tuple, Tuple[int, int, int, int]] = {}
-        
+        # Side-bar automatic placement (Phase B). Decided at startup, on a dock change (edge /
+        # thickness / DPI / Small, or the widget's height), on Reset position and on an icon-alignment
+        # flip; as buttons come and go it changes ONLY when they really reach the widget (the side-bar
+        # watcher's re-check, rc.2 W1) - never just because an app opened (#200 jitter). "Provisional" while
+        # the UIA layout probe is still in flight: decided from the classic HWND rect, re-decided
+        # once when the probe lands.
+        self._side_placement: Optional[SidePlacement] = None
+        self._side_placement_key: Optional[tuple] = None
+        self._side_placement_provisional: bool = False
+        self._side_placement_source: Optional[str] = None   # "uia" / "hwnd" / None - what it used
+        # Called once per decision that ends in "tray_no_room" (the widget shows the one-time heads-up).
+        self.on_side_no_room: Optional[Callable[[], None]] = None
+        # Runtime re-check requested by the side-bar watcher ("full" after an alignment flip, else
+        # "collision"), applied on the next reposition from the watcher's fresh UIA probe.
+        self._side_recheck: Optional[str] = None
+        # The app span (top, bottom) the current decision was taken from: a re-check that finds the
+        # same span changes nothing (rc.2 M2 - a no-room widget "collides" with it every time).
+        self._side_decided_span: Optional[tuple] = None
+        # Polls for the startup probe after a provisional decision, so the UIA re-decision lands
+        # within ~50 ms instead of on the next 1 s tick (rc.2 L1).
+        self._provisional_timer = QTimer(self)
+        self._provisional_timer.setSingleShot(True)
+        self._provisional_timer.setInterval(constants.timeouts.SIDE_BAR_PROBE_POLL_MS)
+        self._provisional_timer.timeout.connect(self._on_provisional_poll)
+        # Keeps the placement right as apps come and go and the alignment flips (rc.2 W1/W2). Only
+        # ever attached to a native side bar.
+        from netspeedtray.core.side_bar_watcher import SideBarWatcher
+        self._side_watcher = SideBarWatcher(self._side_watch_context, self._apply_side_recheck, parent=self)
+
         # Timers
         self._tray_watcher_timer = QTimer(self)
         self._tray_watcher_timer.timeout.connect(self._check_for_tray_changes)
@@ -685,6 +910,10 @@ class PositionManager(QObject):
             # #188: is the preferred monitor a taskbar-less display we should float on?
             if not _float_refreshed:
                 self.refresh_float_state()
+            if self.is_floating():
+                # Free Move / free-float: nothing docked to watch - unhook (L5). Turning it off
+                # re-attaches through the next side-bar placement.
+                self._side_watcher.detach()
 
             # A saved (dragged) position wins in both free-move and free-float.
             if self._apply_saved_position():
@@ -692,6 +921,11 @@ class PositionManager(QObject):
 
             # No saved position + a taskbar-less preferred display -> default-place on that display.
             if self._free_float_active and self._apply_free_float_position():
+                return
+
+            # No taskbar at all while Explorer restarts: keep the last position (the widget hides
+            # meanwhile) instead of moving to the off-bar fallback spot (rc.2 W5).
+            if self.holding_for_taskbar(self._state.taskbar_info):
                 return
 
             # A just-restarted taskbar reports a degenerate tray rect for seconds (live: the
@@ -708,6 +942,41 @@ class PositionManager(QObject):
                 logger.warning("Failed to calculate position.")
         except Exception as e:
             logger.error("Error updating position: %s", e, exc_info=True)
+
+    def holding_for_taskbar(self, info: Any) -> bool:
+        """
+        True while a DOCKED widget that has had a real taskbar sees none at all (``hwnd == 0``, the
+        fallback TaskbarInfo get_taskbar_info returns while Explorer restarts) - for at most
+        TASKBAR_ABSENT_HOLD_MS. Callers then keep the last position and the widget hides, instead
+        of floating at the screen-fallback spot for the ~2 s until the new taskbar exists (rc.2 W5).
+
+        False with a real taskbar (which it records), before any real taskbar was ever seen (a
+        start with no shell keeps the old fallback), for Free Move / free-float (nothing docked),
+        and once the hold has run out (the old behaviour; logged once per absence). The "tray rect
+        not ready" stretch after the new taskbar appears is #419's (_tray_rect_ready), not this.
+        """
+        hwnd = getattr(info, "hwnd", 0) if info is not None else 0
+        if hwnd:
+            if self._taskbar_absent_since is not None:
+                logger.info("Taskbar is back after %.1fs.", time.monotonic() - self._taskbar_absent_since)
+            self._had_real_taskbar = True
+            self._taskbar_absent_since = None
+            self._taskbar_hold_expired_logged = False
+            return False
+        if not self._had_real_taskbar or self.is_floating():
+            return False
+        now = time.monotonic()
+        if self._taskbar_absent_since is None:
+            self._taskbar_absent_since = now
+            logger.info("No taskbar found (Explorer restarting?) - hiding the widget at its last "
+                        "position for up to %.0fs.", constants.timeouts.TASKBAR_ABSENT_HOLD_MS / 1000.0)
+        if (now - self._taskbar_absent_since) * 1000.0 < constants.timeouts.TASKBAR_ABSENT_HOLD_MS:
+            return True
+        if not self._taskbar_hold_expired_logged:
+            self._taskbar_hold_expired_logged = True
+            logger.warning("Still no taskbar after %.0fs - showing the widget at the fallback position.",
+                           now - self._taskbar_absent_since)
+        return False
 
     @staticmethod
     def _tray_memory_key(info: Any) -> Optional[tuple]:
@@ -776,6 +1045,10 @@ class PositionManager(QObject):
             if tray is not None:
                 try:
                     self._remember_tray(info, tray)
+                    seen = (int(info.hwnd or 0),) + tuple(int(v) for v in tray)
+                    if self._last_seen_tray is not None and seen != self._last_seen_tray:
+                        self.note_layout_settle("tray change")   # e.g. a tray icon arrived (W8)
+                    self._last_seen_tray = seen
                 except Exception:
                     pass
             if self._tray_not_ready_logged:
@@ -908,8 +1181,201 @@ class PositionManager(QObject):
         return self._calculator.calculate_position(
             self._state.taskbar_info,
             widget_size,
-            self._state.config
+            self._state.config,
+            side_placement=self._side_placement_for(self._state.taskbar_info, widget_size[1]),
         )
+
+    def _side_placement_for(self, taskbar_info: TaskbarInfo, widget_height: int) -> Optional[SidePlacement]:
+        """The automatic side-bar placement for this dock, re-decided only when the dock changed (or a
+        decision taken without the UIA layout can now use it). None on TOP/BOTTOM bars,
+        ExplorerPatcher-style bars and fallback taskbars, where nothing changes."""
+        try:
+            if taskbar_info is None or not taskbar_info.hwnd:
+                self._side_placement_key = None
+                return None
+            edge = taskbar_info.get_edge_position()
+            dpi = taskbar_info.dpi_scale if taskbar_info.dpi_scale > 0 else 1.0
+            if (edge not in (constants.taskbar.edge.LEFT, constants.taskbar.edge.RIGHT)
+                    or side_bar_geometry(taskbar_info, dpi) is None):
+                # Not a native side bar (any more): forget the dock, so coming back to the same side
+                # bar (side -> bottom -> side, same signature) decides and probes afresh.
+                self._side_placement_key = None
+                self._side_recheck = None
+                self._side_watcher.detach()
+                return None
+            hwnd = int(taskbar_info.hwnd)
+            self._side_watcher.attach(hwnd)
+            key = (taskbar_utils.dock_signature(taskbar_info), hwnd, int(widget_height))
+            if key != self._side_placement_key:
+                # New dock (or first sight): probe the layout afresh; decide now from what we have.
+                self._side_placement_key = key
+                self._side_recheck = None
+                self._side_decided_span = None
+                taskbar_utils.request_taskbar_layout_probe(hwnd)
+                # Appear once (L1): give the probe a short, bounded wait before the first decision.
+                taskbar_utils.wait_for_taskbar_layout(
+                    hwnd, constants.timeouts.SIDE_BAR_FIRST_LAYOUT_WAIT_MS / 1000.0)
+                placement = self._decide_side_placement(taskbar_info, dpi, widget_height)
+                if self._side_placement_provisional:
+                    self._provisional_timer.start()
+                return placement
+            if self._side_recheck is not None and not self._widget_busy():
+                kind, self._side_recheck = self._side_recheck, None
+                return self._recheck_side_placement(taskbar_info, dpi, widget_height, kind)
+            if self._side_placement_source != "uia":
+                # Decided from the classic HWND rect: re-decide once the probe has finished - with
+                # its result, or (failed / timed out) to make the HWND-based decision final.
+                apps, _widgets, pending = taskbar_utils.taskbar_layout_snapshot(hwnd)
+                if apps is not None or (self._side_placement_provisional and not pending):
+                    return self._decide_side_placement(taskbar_info, dpi, widget_height)
+            return self._side_placement
+        except Exception as e:
+            logger.error("Side-bar placement failed: %s", e, exc_info=True)
+            return None
+
+    def _decide_side_placement(self, taskbar_info: TaskbarInfo, dpi: float,
+                               widget_height: int) -> Optional[SidePlacement]:
+        # ONE snapshot of the probe: the rects used and the provisional flag describe the same
+        # moment, so a probe landing mid-decision can't leave a lagging-rect decision marked final.
+        # The TaskbarInfo's own apps/widgets fields are not trusted here (read at another time).
+        apps, source, widgets, pending = taskbar_utils.taskbar_layout_for(taskbar_info.hwnd)
+        overflow = taskbar_utils.taskbar_layout_overflow(taskbar_info.hwnd) if source == "uia" else None
+        geo = side_bar_geometry(taskbar_info, dpi, apps=apps, widgets=widgets, overflow=overflow)
+        if geo is None:
+            return None
+        placement = choose_side_placement(geo, widget_height)
+        previous = self._side_placement
+        was_provisional = self._side_placement_provisional
+        self._side_placement = placement
+        self._side_placement_source = source
+        self._side_placement_provisional = bool(pending) and source != "uia"
+        self._side_decided_span = (geo.apps_top, geo.apps_bottom)
+        # INFO only when the outcome changes (M2: a re-check every few seconds that lands on the same
+        # spot used to log two INFO lines each time).
+        changed = (previous is None or previous != placement
+                   or was_provisional != self._side_placement_provisional)
+        logger.log(logging.INFO if changed else logging.DEBUG,
+                   "Side-bar placement: %s%s (apps %s..%s, overflow %s..%s, tray %s, from %s%s).",
+                   placement.mode, "" if placement.y is None else " y=%d" % placement.y,
+                   geo.apps_top, geo.apps_bottom, geo.overflow_top, geo.overflow_bottom, geo.tray_top,
+                   source, ", provisional" if self._side_placement_provisional else "")
+        if (placement.mode == "tray_no_room" and not self._side_placement_provisional
+                and not user_placed_side_offset(self._state.config) and self.on_side_no_room is not None):
+            try:
+                self.on_side_no_room()
+            except Exception as e:
+                logger.debug("no-room callback failed: %s", e)
+        return placement
+
+    def _recheck_side_placement(self, taskbar_info: TaskbarInfo, dpi: float, widget_height: int,
+                                kind: str) -> Optional[SidePlacement]:
+        """Apply the side-bar watcher's fresh UIA probe. ``"full"`` (the icon alignment flipped: the
+        Widgets button and the app group moved) decides the placement afresh. ``"collision"`` moves the
+        widget only when the fresh app span really reaches it - apps coming and going elsewhere never
+        move it (#200) - and never while the user's drag offset is in force."""
+        if kind == "full" or self._side_placement is None:
+            return self._decide_side_placement(taskbar_info, dpi, widget_height)
+        if user_placed_side_offset(self._state.config):
+            return self._side_placement
+        apps, source, widgets, _pending = taskbar_utils.taskbar_layout_for(taskbar_info.hwnd)
+        geo = side_bar_geometry(taskbar_info, dpi, apps=apps, widgets=widgets)
+        if geo is None or geo.apps_top is None or geo.apps_bottom is None or source != "uia":
+            return self._side_placement
+        span = (geo.apps_top, geo.apps_bottom)
+        if self._side_decided_span is not None and all(
+                abs(a - b) < 1.0 for a, b in zip(span, self._side_decided_span)):
+            # The decision was taken from this very span (a no-room widget overlaps it by design).
+            return self._side_placement
+        try:
+            top = float(self._state.widget.pos().y())
+        except Exception:
+            return self._side_placement
+        clearance = constants.layout.DEFAULT_PADDING
+        bottom = top + widget_height
+        if geo.apps_bottom + clearance <= top or bottom + clearance <= geo.apps_top:
+            logger.debug("Side-bar re-check: apps %s..%s clear of the widget %s..%s - staying.",
+                         geo.apps_top, geo.apps_bottom, top, bottom)
+            return self._side_placement
+        logger.debug("Side-bar re-check: apps %s..%s now reach the widget %s..%s - re-deciding.",
+                     geo.apps_top, geo.apps_bottom, top, bottom)
+        return self._decide_side_placement(taskbar_info, dpi, widget_height)
+
+    def _apply_side_recheck(self, full: bool) -> None:
+        """SideBarWatcher callback: its probe landed; re-place from it on this (GUI) thread.
+
+        Never while the user drags the widget or has its menu open (rc.2 live test M1: a probe landing
+        mid-drag moved the widget 183 -> 92 -> 186 in 13 ms, and the release could save the automatic
+        spot as the user's): the request is kept and applied by the first reposition after it."""
+        if full or self._side_recheck is None:
+            self._side_recheck = "full" if full else "collision"
+        if self._widget_busy():
+            logger.debug("Side-bar re-check deferred: the widget is being dragged / its menu is open.")
+            return
+        self._last_applied_geometry = None
+        self.update_position()
+
+    def _widget_busy(self) -> bool:
+        widget = self._state.widget
+        # ``is True``: the real widget keeps plain bools; a stand-in without them is never "busy".
+        return (getattr(widget, "_dragging", False) is True
+                or getattr(widget, "_is_context_menu_visible", False) is True)
+
+    def _on_provisional_poll(self) -> None:
+        """A provisional (HWND-rect) first decision: re-place as soon as its UIA probe is in (L1)."""
+        info = self._state.taskbar_info
+        if not self._side_placement_provisional or info is None or not info.hwnd:
+            return
+        _apps, _widgets, pending = taskbar_utils.taskbar_layout_snapshot(info.hwnd)
+        if pending:
+            self._provisional_timer.start()
+            return
+        if self._widget_busy():
+            self._provisional_timer.start()
+            return
+        self._last_applied_geometry = None
+        self.update_position()
+
+    def _side_watch_context(self):
+        """What the side-bar watcher compares against: None while there is nothing to watch (not a
+        native side bar, floating, hidden, or mid-drag)."""
+        from netspeedtray.core.side_bar_watcher import SideWatchContext
+        info = self._state.taskbar_info
+        widget = self._state.widget
+        if info is None or not info.hwnd or self._side_placement_key is None or self.is_floating():
+            return None
+        if self._widget_busy() or not widget.isVisible():
+            return None
+        dpi = info.dpi_scale if info.dpi_scale > 0 else 1.0
+        top = float(widget.pos().y())
+        return SideWatchContext(hwnd=int(info.hwnd), dpi=dpi, widget=(top, top + widget.height()),
+                                user_placed=user_placed_side_offset(self._state.config))
+
+    def note_foreground_change(self) -> None:
+        """The widget saw a foreground change: a new app's button may be growing the side bar's app
+        group toward it (side-bar watcher; no-op elsewhere)."""
+        self._side_watcher.note_foreground_change()
+
+    def note_taskbar_alignment_hint(self) -> None:
+        """A WM_SETTINGCHANGE / alignment signal: let the side-bar watcher compare TaskbarAl."""
+        self._side_watcher.note_alignment_maybe_changed()
+
+    def side_bar_tick(self) -> None:
+        """The widget's 1 s safety-net tick (side-bar watcher: alignment + bounded near re-check)."""
+        self._side_watcher.on_tick()
+
+    def stop_side_watcher(self) -> None:
+        """Unhook (app shutdown)."""
+        self._provisional_timer.stop()
+        self._side_watcher.detach()
+
+    def forget_side_placement(self) -> None:
+        """Re-decide the side-bar placement on the next reposition (Reset position)."""
+        self._side_recheck = None
+        self._side_decided_span = None
+        self._side_placement = None
+        self._side_placement_key = None
+        self._side_placement_provisional = False
+        self._side_placement_source = None
 
     @pyqtSlot()
     def _check_for_tray_changes(self) -> None:
@@ -974,17 +1440,44 @@ class PositionManager(QObject):
         """
         Resets the widget to its default position: clears the saved free-move spot AND the docked
         drag offsets (tray_offset_x / tray_offset_y - a docked drag's offset otherwise outlived every
-        reset), and repositions.
+        reset), forgets the side-bar placement so it is decided afresh, and repositions.
         """
         defaults = constants.config.defaults
         self._state.config['position_x'] = None
         self._state.config['position_y'] = None
         self._state.config['tray_offset_x'] = defaults.DEFAULT_TRAY_OFFSET_X
         self._state.config['tray_offset_y'] = defaults.DEFAULT_TRAY_OFFSET_Y
+        self.forget_side_placement()
         self._last_applied_geometry = None
         # We rely on the caller (Widget) to persist this config change to disk if needed.
         self.update_position()
         self.ensure_topmost()
+
+    def move_to_default_for_session(self) -> bool:
+        """
+        Put the widget at its automatic docked spot NOW, without touching the saved Free Move spot or
+        the drag offsets (unlike reset_to_default). For the second launch (#234): a duplicate start at
+        sign-in can arrive before a slow monitor holding the saved spot connects, and must not wipe
+        that spot (#440 review L3). Returns True if the widget was moved.
+        """
+        defaults = constants.config.defaults
+        info = self._state.taskbar_info or get_taskbar_info(
+            preferred_screen_name=self._state.config.get('preferred_monitor'))
+        widget = self._state.widget
+        size = (widget.width(), widget.height())
+        if info is None or size[0] <= 0 or size[1] <= 0:
+            return False
+        session_cfg = dict(self._state.config)
+        session_cfg.update(position_x=None, position_y=None,
+                           tray_offset_x=defaults.DEFAULT_TRAY_OFFSET_X,
+                           tray_offset_y=defaults.DEFAULT_TRAY_OFFSET_Y)
+        pos = self._calculator.calculate_position(
+            info, size, session_cfg, side_placement=self._side_placement_for(info, size[1]))
+        if not pos:
+            return False
+        self._last_applied_geometry = None
+        self._apply_geometry(pos.x, pos.y)
+        return True
 
     def _ensure_taskbar_owner(self, hwnd: int) -> bool:
         """
@@ -1004,12 +1497,16 @@ class PositionManager(QObject):
             True iff the owner was just (re)established on this call.
         """
         try:
-            tb_info = self._state.taskbar_info or get_taskbar_info()
+            # Fallback: the widget's own (preferred-monitor) taskbar, never a bare lookup - that is
+            # the PRIMARY's, and would dock a secondary-monitor widget to it (rc.2 W12).
+            tb_info = self._state.taskbar_info or get_taskbar_info(
+                preferred_screen_name=self._state.config.get('preferred_monitor'))
             tb_hwnd = int(tb_info.hwnd) if tb_info and tb_info.hwnd else 0
             if not tb_hwnd or not win32gui.IsWindow(tb_hwnd):
                 return False
             if (_GetWindowLongPtr(hwnd, _GWLP_HWNDPARENT) or 0) != tb_hwnd:
                 _SetWindowLongPtr(hwnd, _GWLP_HWNDPARENT, tb_hwnd)
+                self._owner_set_to = tb_hwnd
                 logger.debug("Widget docked to taskbar HWND %s (owner Z-order).", tb_hwnd)
                 return True
         except Exception as e:
@@ -1054,6 +1551,14 @@ class PositionManager(QObject):
                     hwnd, win32con.HWND_TOPMOST, 0, 0, 0, 0,
                     win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | win32con.SWP_NOACTIVATE
                 )
+                # A burial right after docking to a NEW taskbar (startup, Explorer restart) is the
+                # shell laying it out (W8). Qt also drops the owner across show / flag changes (e.g.
+                # after a fullscreen app) and it is re-set to the SAME taskbar: a burial then is real
+                # and keeps its INFO line (#440 review L4).
+                owner = self._owner_set_to
+                if owner != self._last_dock_owner:
+                    self._last_dock_owner = owner
+                    self.note_layout_settle("dock")
             # A widget that fell out of the topmost band (Qt can drop WS_EX_TOPMOST across
             # show/flag changes) is necessarily BELOW the topmost taskbar, so it is "buried"
             # in is_buried_behind_taskbar()'s terms and the widget's guarded recovery path
@@ -1314,22 +1819,13 @@ class PositionManager(QObject):
                 return True
             if fresh:
                 self._fresh_reseat_times.append(now)
-                if self._first_recovery_logged:
-                    logger.debug("Widget re-seated above the taskbar after a fresh burial "
-                                 "(no backoff charged).")
-                else:
-                    logger.info("Widget recovered from taskbar burial - re-seated directly above "
-                                "the taskbar.")
-                    self._first_recovery_logged = True
+                self._log_recovery(now, "Widget re-seated above the taskbar after a fresh burial "
+                                        "(no backoff charged).")
                 return True
             self._last_reseat_ts = now
             self._reseat_attempts = min(self._reseat_attempts + 1, _RESEAT_BACKOFF_EXP_CAP + 1)
             self._deferral_logged = None
-            if self._first_recovery_logged:
-                logger.debug("Widget re-seated above the taskbar (attempt %d).", self._reseat_attempts)
-            else:
-                logger.info("Widget recovered from taskbar burial - re-seated directly above the taskbar.")
-                self._first_recovery_logged = True
+            self._log_recovery(now, "Widget re-seated above the taskbar (attempt %d).", self._reseat_attempts)
             return True
         except Exception as e:
             logger.error("Failed to re-seat the widget above the taskbar: %s", e)
@@ -1394,6 +1890,37 @@ class PositionManager(QObject):
                         "Z-band %s (taskbar Z-band %s): %s.",
                         prev_class, _window_band(prev), tb_band, outcome)
         return ok
+
+    def _log_recovery(self, now: float, debug_msg: str, *args) -> None:
+        """
+        Log a re-seat: INFO for the first one of an episode, DEBUG for the rest (#327). A re-seat
+        within _BURIAL_LOG_SETTLE_S of the widget docking or of a tray change is the shell laying
+        the taskbar out, not a burial worth a support-bundle line: DEBUG, and the INFO line stays
+        for the next real one (rc.2 W8 - a startup false burial or a tray-icon arrival used it up).
+        """
+        settling = bool(self._layout_settle_ts) and now - self._layout_settle_ts < _BURIAL_LOG_SETTLE_S
+        if self._first_recovery_logged or settling:
+            logger.debug(debug_msg + (" (taskbar settling after a dock / tray change)" if settling else ""),
+                         *args)
+            return
+        logger.info("Widget recovered from taskbar burial - re-seated directly above the taskbar.")
+        self._first_recovery_logged = True
+        self._recovery_info_ts = now
+
+    def note_layout_settle(self, reason: str = "") -> None:
+        """
+        The widget just docked (owner set) or the tray rect changed: the shell is re-laying the
+        taskbar, and a burial now is part of that (rc.2 W8). Starts the settle window; an INFO
+        recovery logged just BEFORE it (the tray-icon arrival buries the widget first, the tray rect
+        changes on the next ~1 s refresh) is handed back, so the next real burial logs at INFO.
+        """
+        now = time.monotonic()
+        self._layout_settle_ts = now
+        if self._first_recovery_logged and self._recovery_info_ts and \
+                now - self._recovery_info_ts < _BURIAL_LOG_SETTLE_S:
+            self._first_recovery_logged = False
+            logger.debug("The last burial recovery came with a %s - the next one logs at INFO again.",
+                         reason or "layout change")
 
     def _log_deferral(self, reason: str, msg: str, *args) -> None:
         """DEBUG-log a deferred re-seat once per (reason, backoff window), not once per tick."""

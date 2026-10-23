@@ -83,7 +83,7 @@ class SettingsDialog(QDialog):
         "location_onboarding_dismissed", "widgets_overlap_nudge_shown", "history_upgrade_notice_shown",
         "monitor_active_tab", "history_period", "history_period_slider_value", "history_period_chosen",
         "paused", "last_update_check", "skipped_version", "usage_alert_state", "start_with_windows",
-        "pin_hint_shown_count",
+        "pin_hint_shown_count", "side_bar_no_room_notice_shown",
     )
 
     def __init__(
@@ -308,7 +308,8 @@ class SettingsDialog(QDialog):
             self.units_page = self.appearance_page.units_section
 
             self.hardware_page = HardwarePage(self.i18n, self._schedule_settings_update,
-                                              self._open_color_dialog)
+                                              self._open_color_dialog,
+                                              lhm_status_provider=self._lhm_status)
             self.interfaces_page = InterfacesPage(
                 self.i18n,
                 self.available_interfaces,
@@ -321,6 +322,8 @@ class SettingsDialog(QDialog):
                 reset_page_callback=self._reset_advanced_page,
                 reset_all_callback=self._reset_all_to_defaults,
                 delete_history_callback=self._delete_all_history,
+                history_path_callback=self._history_db_path,
+                notify_callback=self._notify_backup_result,
             )
             # The Record-hardware-history card greys out live as CPU/GPU monitoring is switched.
             # The battery hover toggle counts too (#323) - see _sync_record_card.
@@ -561,6 +564,12 @@ class SettingsDialog(QDialog):
         # The emit applied the settings synchronously (incl. starting/stopping the metrics endpoint),
         # so the endpoint's status now describes what the user just chose.
         self._refresh_metrics_status()
+
+    def _lhm_status(self):
+        """(status, port) of the running LibreHardwareMonitor client, for Settings > Hardware."""
+        mt = getattr(self.parent_widget, "monitor_thread", None)
+        status, port = getattr(mt, "lhm_status", None), getattr(mt, "lhm_port", None)
+        return (status, port) if isinstance(status, str) and isinstance(port, int) else None
 
     def _refresh_metrics_status(self) -> None:
         """Show the local metrics endpoint's live status (listening / port in use) under its address."""
@@ -847,6 +856,17 @@ class SettingsDialog(QDialog):
         if box.clickedButton() is not delete_btn:
             return None
         return usage.isChecked()
+
+    def _history_db_path(self):
+        """The live history file for Settings > Advanced > Back up history (#334), or None."""
+        ws = getattr(self.parent_widget, "widget_state", None)
+        return getattr(ws, "history_db_path", None) if ws is not None else None
+
+    def _notify_backup_result(self, title: str, body: str, path) -> None:
+        """A backup that finished while Settings was closed: the widget's non-focus flyout (#334)."""
+        notify = getattr(self.parent_widget, "show_backup_notice", None)
+        if notify is not None:
+            notify(title, body, path)
 
     def _delete_all_history(self) -> None:
         """Settings > Advanced > Delete all history (2.2 item C). Immediate - not deferred to Save."""

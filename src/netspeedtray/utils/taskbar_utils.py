@@ -108,6 +108,289 @@ def find_tasklist_rect(taskbar_hwnd: int) -> Optional[Tuple[int, int, int, int]]
         return None
 
 
+def find_toolbar_bands_rect(taskbar_hwnd: int) -> Optional[Tuple[int, int, int, int]]:
+    """
+    Physical-px union of the classic taskbar toolbars (Desktop, Links, Address, a folder toolbar) that
+    sit AFTER the task list - between the app buttons and the tray - or None (#324, rc.2 F12;
+    best-effort, Windows 10). Each toolbar is a ReBarWindow32 band beside the MSTaskSwWClass one; the
+    widget hugs the tray, so it was drawn over them.
+
+    Windows 11 has no taskbar toolbars: its ReBarWindow32 holds MSTaskSwWClass only (probed on
+    26200), so this is None there and nothing changes. A band before the task list (dragged to the
+    start of the bar) is left out: the widget never sits there.
+    """
+    try:
+        rebar = win32gui.FindWindowEx(taskbar_hwnd, 0, "ReBarWindow32", None)
+        if not rebar:
+            return None
+        tasksw = win32gui.FindWindowEx(rebar, 0, "MSTaskSwWClass", None)
+        if not tasksw:
+            return None
+        task = valid_rect(tuple(win32gui.GetWindowRect(tasksw)))
+        if task is None:
+            return None
+        vertical = (task[3] - task[1]) > (task[2] - task[0])
+        tol = constants.layout.TOOLBAR_BAND_ADJACENCY_TOLERANCE_PX
+        bands = []
+        child = win32gui.FindWindowEx(rebar, 0, None, None)
+        for _ in range(constants.layout.TOOLBAR_BAND_SCAN_LIMIT):
+            if not child:
+                break
+            if child != tasksw and win32gui.IsWindowVisible(child):
+                r = valid_rect(tuple(win32gui.GetWindowRect(child)))
+                if r is not None and ((r[1] >= task[3] - tol) if vertical else (r[0] >= task[2] - tol)):
+                    bands.append(r)
+            child = win32gui.FindWindowEx(rebar, child, None, None)
+        if not bands:
+            return None
+        return (min(b[0] for b in bands), min(b[1] for b in bands),
+                max(b[2] for b in bands), max(b[3] for b in bands))
+    except Exception as e:
+        logger.debug("Toolbar band scan failed for taskbar HWND %s: %s", taskbar_hwnd, e)
+        return None
+
+
+def valid_rect(rect: Any) -> Optional[Tuple[int, int, int, int]]:
+    """``rect`` as a ``(left, top, right, bottom)`` tuple when it is a real, non-empty rect, else None.
+
+    The side-bar placement reads several optional rects (apps extent, Widgets button, tasklist);
+    a mocked or half-built TaskbarInfo can carry anything there, and an empty rect means "absent"."""
+    if not isinstance(rect, (tuple, list)) or len(rect) != 4:
+        return None
+    if not all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in rect):
+        return None
+    left, top, right, bottom = rect
+    if right <= left or bottom <= top:
+        return None
+    return (left, top, right, bottom)
+
+
+def find_apps_rect(taskbar_hwnd: int) -> Optional[Tuple[int, int, int, int]]:
+    """The Win11 Start-to-last-app span from the classic HWNDs: ``MSTaskSwWClass`` (else its
+    ``ReBarWindow32`` parent), physical px, or None.
+
+    Only a FALLBACK for ``apps_extent``: probed live on Win11 26200 (2026-10-21) the rect stopped at
+    the 10th of 12 app buttons (651..1136 while UIA put the last button at 1225..1269) - Explorer
+    no longer resizes these XAML-era HWNDs as buttons come and go. The UIA union
+    (``request_taskbar_layout_probe``) is the real source. Unlike ``find_tasklist_rect`` this needs
+    no ``ToolbarWindow32`` (which Win11 doesn't have), and it is never used on horizontal bars, so
+    it can't trigger their app-icon safe-zone snap."""
+    try:
+        rebar = win32gui.FindWindowEx(taskbar_hwnd, 0, "ReBarWindow32", None)
+        if not rebar:
+            return None
+        tasksw = win32gui.FindWindowEx(rebar, 0, "MSTaskSwWClass", None)
+        return valid_rect(tuple(win32gui.GetWindowRect(tasksw or rebar)))
+    except Exception as e:  # noqa: BLE001 - fail-safe: no rect
+        logger.debug("apps rect lookup failed for taskbar HWND %s: %s", taskbar_hwnd, e)
+        return None
+
+
+# --- Side-taskbar layout probe (apps extent + Widgets button) ------------------------------------
+# Where the app buttons and the Widgets button sit on a SIDE taskbar decides where the widget goes
+# (PositionManager side placement). Win11's buttons live in a XAML island, so the truth comes from
+# UI Automation (utils/uia_widgets.query_taskbar_layout, in-process, ~10 ms cross-process) on a
+# background thread. Unlike the #200 Widgets probe this one has NO periodic refresh: it is requested
+# at startup, on a dock change, on Reset position, and - as re-checks that KEEP the last result until
+# the new one lands (``keep_last``) - when core/side_bar_watcher predicts the app group reaching the
+# widget or sees the icon alignment flip. It never runs for a TOP/BOTTOM bar today (#24 may reuse it).
+_layout_lock = threading.Lock()
+# Notified (under _layout_lock) whenever a probe lands or a request ends: wait_for_taskbar_layout.
+_layout_landed = threading.Condition(_layout_lock)
+# gen: bumped by every request (a result for an older gen is dropped); running: a worker thread is
+# alive (at most one at a time - repeated requests re-run it instead of piling up threads);
+# started: monotonic time of the current gen's request, for the timeout.
+# group: the contiguous Start-led button run (uia_widgets.app_group_from_elements), for consumers that
+# must not count far-away buttons; landed: how many probe results have landed (a sequence number).
+_layout_state: dict = {"hwnd": 0, "apps": None, "widgets": None, "group": None, "overflow": None,
+                       "pending": False,
+                       "done": False, "gen": 0, "running": False, "started": 0.0, "landed": 0}
+# A UIA call into a hung Explorer can block for a long time. Past this, the request counts as
+# finished WITHOUT a result (placement goes final on the classic HWND rect); a late result is dropped.
+LAYOUT_PROBE_TIMEOUT_S = 5.0
+
+
+def _query_taskbar_layout_blocking(taskbar_hwnd: int):
+    """(apps_rect, widgets_rect, app_group_rect) in physical px from UIA, or None. Never raises."""
+    try:
+        from netspeedtray.utils import uia_widgets
+        return uia_widgets.query_taskbar_layout_full(int(taskbar_hwnd))
+    except Exception as e:  # noqa: BLE001
+        logger.debug("Taskbar layout UIA probe failed: %s", e)
+        return None
+
+
+def _layout_worker() -> None:
+    """Probe until the newest request has been answered (requests made meanwhile re-run it)."""
+    while True:
+        with _layout_lock:
+            gen, hwnd = _layout_state["gen"], _layout_state["hwnd"]
+            if not _layout_state["pending"]:
+                _layout_state["running"] = False
+                return
+        result = _query_taskbar_layout_blocking(hwnd)
+        overflow = None
+        if isinstance(result, tuple) and len(result) == 4:
+            apps, widgets, group, overflow = result
+        elif isinstance(result, tuple) and len(result) == 3:
+            apps, widgets, group = result
+        elif isinstance(result, tuple) and len(result) == 2:
+            (apps, widgets), group = result, None
+        else:
+            apps = widgets = group = None
+        with _layout_lock:
+            if _layout_state["gen"] == gen and _layout_state["pending"]:
+                _layout_state.update(apps=valid_rect(apps), widgets=valid_rect(widgets),
+                                     group=valid_rect(group), overflow=valid_rect(overflow),
+                                     pending=False, done=True,
+                                     landed=_layout_state.get("landed", 0) + 1)
+                _layout_landed.notify_all()
+                logger.debug("Taskbar layout probe: apps=%s widgets=%s", apps, widgets)
+            # else: superseded (loop re-runs for the newer request) or timed out (loop exits)
+
+
+def request_taskbar_layout_probe(taskbar_hwnd: Optional[int], keep_last: bool = False) -> None:
+    """Probe ``taskbar_hwnd``'s layout afresh on a background thread.
+
+    Default: drop the cached layout first - until the probe lands (or times out) the snapshot says
+    ``pending`` and ``get_apps_extent`` answers from the classic HWNDs (a one-shot placement).
+    ``keep_last=True`` (a runtime re-check of the SAME taskbar): the last landed result keeps
+    answering until the new one replaces it, so nothing falls back to the lagging HWND rect meanwhile;
+    a timed-out re-check keeps it too."""
+    if not taskbar_hwnd:
+        return
+    with _layout_lock:
+        _layout_state["gen"] += 1
+        same = _layout_state["hwnd"] == int(taskbar_hwnd) and _layout_state["done"]
+        if keep_last and same:
+            _layout_state.update(pending=True, started=time.monotonic())
+        else:
+            _layout_state.update(hwnd=int(taskbar_hwnd), apps=None, widgets=None, group=None,
+                                 overflow=None, pending=True, done=False, started=time.monotonic())
+        start = not _layout_state["running"]
+        _layout_state["running"] = True
+    if start:
+        _start_layout_worker()
+
+
+def _start_layout_worker() -> None:
+    threading.Thread(target=_layout_worker, name="nst-taskbar-layout-uia", daemon=True).start()
+
+
+def taskbar_layout_snapshot(taskbar_hwnd: Optional[int]):
+    """``(apps_rect, widgets_rect, pending)`` for ``taskbar_hwnd``, read under ONE lock so the rects
+    and the pending flag always describe the same moment (a decision taken from them can't use a
+    stale rect yet be marked final). Rects are None until a probe for this taskbar has landed;
+    ``pending`` is True while a requested probe is in flight and not yet timed out."""
+    with _layout_lock:
+        if not taskbar_hwnd or _layout_state["hwnd"] != int(taskbar_hwnd):
+            return None, None, False
+        if _layout_state["pending"] and time.monotonic() - _layout_state["started"] > LAYOUT_PROBE_TIMEOUT_S:
+            if _layout_state["done"]:   # a keep_last re-check: the last result stays
+                logger.info("Taskbar layout re-check timed out after %.0f s; keeping the last layout.",
+                            LAYOUT_PROBE_TIMEOUT_S)
+                _layout_state.update(pending=False)
+            else:
+                logger.info("Taskbar layout probe timed out after %.0f s; using the taskbar's own rect.",
+                            LAYOUT_PROBE_TIMEOUT_S)
+                _layout_state.update(pending=False, done=True, apps=None, widgets=None, group=None,
+                                     overflow=None)
+        if _layout_state["done"]:
+            return _layout_state["apps"], _layout_state["widgets"], bool(_layout_state["pending"])
+        return None, None, bool(_layout_state["pending"])
+
+
+def taskbar_layout_overflow(taskbar_hwnd: Optional[int]) -> Optional[Tuple[int, int, int, int]]:
+    """The last probed "..." overflow button (physical px) for ``taskbar_hwnd``, or None."""
+    taskbar_layout_snapshot(taskbar_hwnd)   # applies the timeout rule
+    with _layout_lock:
+        if not taskbar_hwnd or _layout_state["hwnd"] != int(taskbar_hwnd) or not _layout_state["done"]:
+            return None
+        return _layout_state["overflow"]
+
+
+def wait_for_taskbar_layout(taskbar_hwnd: Optional[int], timeout_s: float) -> bool:
+    """Block up to ``timeout_s`` until the requested probe for ``taskbar_hwnd`` is no longer pending.
+    True when it landed (or nothing was pending). For the FIRST side-bar placement only, so the
+    widget appears once instead of hopping from the lagging HWND rect to the UIA spot (rc.2 L1);
+    the timeout keeps a hung Explorer from holding the GUI thread."""
+    if not taskbar_hwnd:
+        return False
+    deadline = time.monotonic() + max(0.0, timeout_s)
+    with _layout_landed:
+        while _layout_state["hwnd"] == int(taskbar_hwnd) and _layout_state["pending"]:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return False
+            _layout_landed.wait(left)
+        return _layout_state["hwnd"] == int(taskbar_hwnd) and bool(_layout_state["done"])
+
+
+def taskbar_layout_group(taskbar_hwnd: Optional[int]) -> Optional[Tuple[int, int, int, int]]:
+    """The last probed contiguous Start-led button run (physical px) for ``taskbar_hwnd``, or None."""
+    taskbar_layout_snapshot(taskbar_hwnd)   # applies the timeout rule
+    with _layout_lock:
+        if not taskbar_hwnd or _layout_state["hwnd"] != int(taskbar_hwnd) or not _layout_state["done"]:
+            return None
+        return _layout_state["group"]
+
+
+def taskbar_layout_landed_count(taskbar_hwnd: Optional[int]) -> int:
+    """How many probe results have landed (for ``taskbar_hwnd``; -1 for another taskbar): a caller
+    that notes it before a request knows its probe landed - rather than timed out - when it grows."""
+    with _layout_lock:
+        if not taskbar_hwnd or _layout_state["hwnd"] != int(taskbar_hwnd):
+            return -1
+        return int(_layout_state.get("landed", 0))
+
+
+def find_classic_layout_hwnds(taskbar_hwnd: int) -> Tuple[int, int, int]:
+    """``(start, rebar, tasksw)``: the hidden legacy ``Start`` child of the taskbar and the
+    ``ReBarWindow32`` / ``MSTaskSwWClass`` pair, 0 for any that is missing. On Win11 26200 Explorer
+    still moves the ``Start`` window with the XAML Start button - 15-30 ms BEFORE UI Automation
+    reports it (rc.1 live probe) - while the task-switch pair's far edge lags behind the buttons."""
+    start = rebar = tasksw = 0
+    try:
+        start = int(win32gui.FindWindowEx(taskbar_hwnd, 0, "Start", None) or 0)
+        rebar = int(win32gui.FindWindowEx(taskbar_hwnd, 0, "ReBarWindow32", None) or 0)
+        if rebar:
+            tasksw = int(win32gui.FindWindowEx(rebar, 0, "MSTaskSwWClass", None) or 0)
+    except Exception as e:  # noqa: BLE001 - fail-safe
+        logger.debug("classic layout HWND lookup failed for taskbar HWND %s: %s", taskbar_hwnd, e)
+    return start, rebar, tasksw
+
+
+def taskbar_layout_probe_pending(taskbar_hwnd: Optional[int]) -> bool:
+    """True while a requested layout probe for ``taskbar_hwnd`` hasn't landed (or timed out)."""
+    return taskbar_layout_snapshot(taskbar_hwnd)[2]
+
+
+def cached_taskbar_layout(taskbar_hwnd: Optional[int]):
+    """The last probed (apps_rect, widgets_rect) for ``taskbar_hwnd``, (None, None) when unknown."""
+    apps, widgets, _pending = taskbar_layout_snapshot(taskbar_hwnd)
+    return apps, widgets
+
+
+def taskbar_layout_for(taskbar_hwnd: Optional[int]):
+    """``(apps_rect, apps_source, widgets_rect, pending)`` from ONE snapshot: the probed app span
+    (source ``"uia"``) when there is one, else the classic MSTaskSwWClass rect (``"hwnd"``)."""
+    if not taskbar_hwnd:
+        return None, None, None, False
+    apps, widgets, pending = taskbar_layout_snapshot(taskbar_hwnd)
+    if apps is not None:
+        return apps, "uia", widgets, pending
+    rect = find_apps_rect(taskbar_hwnd)
+    return rect, ("hwnd" if rect is not None else None), widgets, pending
+
+
+def get_apps_extent(taskbar_hwnd: Optional[int]) -> Tuple[Optional[Tuple[int, int, int, int]], Optional[str]]:
+    """``(rect, source)``: the app-button span in physical px and where it came from - ``"uia"`` (the
+    probed union of Start/Search/Task View/app buttons), ``"hwnd"`` (the classic MSTaskSwWClass
+    rect, which can lag behind the real buttons), or ``(None, None)``. Non-blocking."""
+    apps, source, _widgets, _pending = taskbar_layout_for(taskbar_hwnd)
+    return apps, source
+
+
 # --- Win11 Widgets/weather element detection (#200 / #24) --------------------------------
 # The Windows 11 Widgets/weather element has NO classic Win32 HWND - it lives inside a XAML island, so
 # EnumChildWindows/GetWindowRect can't see it. It IS reachable via UI Automation: utils/uia_widgets.py
@@ -238,6 +521,17 @@ class TaskbarInfo:
     # Physical-pixel rect of the monitor the taskbar is on (GetMonitorInfo "Monitor", the same call that
     # gives work_area), or None when unknown. Diagnostics only (support bundle, #322).
     monitor_rect: Optional[Tuple[int, int, int, int]] = None
+    # Physical-pixel span of the app buttons (Start .. last app) and where it came from ("uia" /
+    # "hwnd", see get_apps_extent), for SIDE-taskbar placement and drag limits only. Deliberately
+    # not tasklist_rect: that one drives the horizontal app-icon safe-zone snap, and Win11 has none.
+    apps_extent: Optional[Tuple[int, int, int, int]] = None
+    apps_extent_source: Optional[str] = None
+    # The Widgets button's full rect from the same layout probe (independent of the #200 nudge's
+    # widgets_rect, which stops probing once the nudge has been shown).
+    widgets_extent: Optional[Tuple[int, int, int, int]] = None
+    # Physical-pixel union of the classic toolbars (Desktop / Links / ...) between the task list and
+    # the tray, or None - always None on Windows 11 (find_toolbar_bands_rect, #324).
+    toolbars_rect: Optional[Tuple[int, int, int, int]] = None
 
     def __post_init__(self) -> None:
         """Basic validation of critical attributes after initialization."""
@@ -670,6 +964,8 @@ def get_all_taskbar_info() -> List[TaskbarInfo]:
             is_primary_qt = (screen == primary_screen)
             
             screen_geo = screen.geometry()
+            # One snapshot: the apps span and the Widgets box always come from the same probe.
+            apps_extent, apps_source, widgets_extent, _pending = taskbar_layout_for(hwnd)
             return TaskbarInfo(
                 hwnd=hwnd,
                 tray_hwnd=tray_hwnd,
@@ -685,6 +981,10 @@ def get_all_taskbar_info() -> List[TaskbarInfo]:
                 # Shell_TrayWnd root (`hwnd`), not tray_hwnd - the button is under the taskbar frame.
                 widgets_rect=get_widgets_rect(hwnd) if is_primary_qt else None,
                 monitor_rect=tuple(monitor_info["Monitor"]) if monitor_info.get("Monitor") else None,
+                apps_extent=apps_extent,
+                apps_extent_source=apps_source,
+                widgets_extent=widgets_extent,
+                toolbars_rect=find_toolbar_bands_rect(hwnd),
             )
         except win32gui.error as e:
             if e.winerror != 0:
@@ -799,9 +1099,10 @@ def _log_preferred_monitor_fallback(
         )
     logger.info(
         "Preferred monitor '%s' did not match any of %d taskbar(s); using primary. "
-        "Enumerated taskbars: %s. If the preferred monitor has no taskbar of its own, "
-        "enabling 'Show taskbar on all displays' is the current workaround (a no-taskbar "
-        "fallback is tracked in #166).",
+        "Enumerated taskbars: %s. If the preferred monitor is connected but has no taskbar of "
+        "its own, 'Float on a display without a taskbar' (free_float) keeps the widget on it, or "
+        "turn on Windows' 'Show my taskbar on all displays' (Settings shows this under Preferred "
+        "Monitor, rc.2 W13).",
         preferred_screen_name,
         len(taskbars),
         " ".join(details) if details else "(none)",
@@ -824,6 +1125,11 @@ def get_free_float_screen(preferred_screen_name: Optional[str]) -> Optional[QScr
         if screen is None:
             return None  # preferred monitor not connected -> the primary-taskbar fallback is correct
         taskbars = get_all_taskbar_info()
+        if not any(getattr(tb, "hwnd", 0) for tb in taskbars):
+            # NO taskbar anywhere (only the hwnd-0 fallback, or nothing): Explorer is restarting, not
+            # a taskbar-less display. Floating now would put the widget off the bar for the restart;
+            # the docked path's hold keeps it hidden at its last spot instead (rc.2 W5, #440 M2).
+            return None
         if _select_taskbar_for_screen(taskbars, preferred_screen_name) is not None:
             return None  # it has a taskbar of its own -> dock to it normally
         return screen    # present but taskbar-less -> free-float on it
@@ -950,6 +1256,27 @@ def is_taskbar_visible(taskbar_info: Optional[TaskbarInfo]) -> bool:
         return False
 
 
+def is_rdp_client_covering_monitor(hwnd: int, class_name: str,
+                                   monitor_rect: Optional[Tuple[int, int, int, int]]) -> bool:
+    """
+    True when ``hwnd`` is a full-screen Remote Desktop client window (no caption) whose rect
+    contains the whole ``monitor_rect`` - the multi-monitor RDP session ("Use all my monitors"), one
+    window spanning every monitor, that the window == monitor fullscreen test misses (#132). A
+    windowed session (caption on, even maximized) and any other window class are never matched.
+    """
+    try:
+        if class_name not in constants.shell.shell.RDP_CLIENT_WINDOW_CLASSES or not monitor_rect:
+            return False
+        style = win32gui.GetWindowLong(hwnd, win32con.GWL_STYLE)
+        if (style & win32con.WS_CAPTION) == win32con.WS_CAPTION:
+            return False
+        left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+        m_left, m_top, m_right, m_bottom = monitor_rect
+        return left <= m_left and top <= m_top and right >= m_right and bottom >= m_bottom
+    except Exception:
+        return False
+
+
 def is_taskbar_obstructed(taskbar_info: Optional[TaskbarInfo], hwnd_to_check: int) -> bool:
     """
     Checks if the taskbar is obstructed by a specific window.
@@ -981,6 +1308,12 @@ def is_taskbar_obstructed(taskbar_info: Optional[TaskbarInfo], hwnd_to_check: in
         try:
             fg_monitor = win32api.MonitorFromWindow(hwnd_to_check, MONITOR_DEFAULTTONEAREST)
             tb_monitor = win32api.MonitorFromWindow(taskbar_info.hwnd, MONITOR_DEFAULTTONEAREST)
+            # A multi-monitor RDP session is one window across all monitors - "its" monitor may be
+            # another one - so it is judged against the taskbar's monitor before that check (#132).
+            if class_name in constants.shell.shell.RDP_CLIENT_WINDOW_CLASSES and \
+                    is_rdp_client_covering_monitor(hwnd_to_check, class_name,
+                                                   win32api.GetMonitorInfo(tb_monitor).get('Monitor')):
+                return True
             if fg_monitor != tb_monitor:
                 return False
 
