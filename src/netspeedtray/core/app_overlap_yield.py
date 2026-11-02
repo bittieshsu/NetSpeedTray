@@ -14,8 +14,9 @@ fullscreen hide (``_execute_refresh``), and it comes back after two clear readin
 
 A yielded widget is the app's only surface (no tray icon), so there is always a way back:
 Settings > Widget > "Hide while app buttons cover the widget" (``hide_when_apps_cover``) turns the
-yield off, and a second launch of the app (#440's activate message) suspends it for the rest of the
-session (``suspend_for_session``).
+yield off, and a second launch of the app (#440's activate message) while it is yielded suspends it
+for the rest of the session (``suspend_for_session``; a launch that finds it not yielded leaves it on,
+#373).
 
 What is judged: the widget's x span - its real position while it is shown, the position it WOULD get
 (PositionManager computes it) while it is hidden: a hidden window is never re-placed, so its stale
@@ -113,15 +114,20 @@ class OverlapContext:
     # "Mostly cloudy" the rc.2 spot drew the arrow and "0.0" over the text). False also when the
     # content extent is unknown - hiding is better than colliding: the yield then steps aside instead.
     tray_spot_clear: bool = False
+    # The screen's Qt x origin (QScreen.geometry().left()): physical UIA rects convert to logical px
+    # around it (taskbar_utils.physical_to_logical, #373). 0 on the primary.
+    x_origin: float = 0.0
 
 
-def group_span(group_rect, dpi: float) -> Optional[Span]:
-    """The app group's x span in logical px from its physical UIA rect, or None."""
+def group_span(group_rect, dpi: float, x_origin: float = 0.0) -> Optional[Span]:
+    """The app group's x span in logical px from its physical UIA rect, or None. ``x_origin``: the
+    screen's Qt x origin (0 on the primary, where this is rect / dpi)."""
     rect = taskbar_utils.valid_rect(group_rect)
     if rect is None:
         return None
     scale = dpi if dpi and dpi > 0 else 1.0
-    return rect[0] / scale, rect[2] / scale
+    return (taskbar_utils.physical_to_logical(rect[0], x_origin, scale),
+            taskbar_utils.physical_to_logical(rect[2], x_origin, scale))
 
 
 def group_reaches_widget(group: Optional[Span], widget: Span,
@@ -298,12 +304,15 @@ class AppOverlapYield(QObject):
         self._near_interval_ms = constants.timeouts.SIDE_BAR_NEAR_RECHECK_MS
 
     def suspend_for_session(self) -> bool:
-        """A second launch asked for the widget: no yield for the rest of this session. True when it
-        was yielded (the caller then explains why it had stepped aside)."""
-        was = self.yielded
+        """A second launch asked for the widget: when the yield had HIDDEN it, no yield for the rest of
+        this session, and True (the caller then explains why it had stepped aside). Otherwise - still
+        starting, mid-hysteresis, the full-bar fallback by the tray - nothing changes and False: the
+        launch did not need the yield gone, and the yield keeps working (#373)."""
+        if not self.yielded:
+            return False
         self._suspended = True
         self.detach("NetSpeedTray was started again - staying visible for this session")
-        return was
+        return True
 
     def sync(self) -> None:
         """The 1 s refresh tick (and every refresh): attach / detach from the current context, then
@@ -554,7 +563,7 @@ class AppOverlapYield(QObject):
         if ctx is None:
             self._finish()
             return
-        span = group_span(group_rect, ctx.dpi) if landed else None
+        span = group_span(group_rect, ctx.dpi, ctx.x_origin) if landed else None
         self._last_group_rect = group_rect
         if landed:
             t = constants.timeouts
