@@ -369,7 +369,8 @@ def _store_landed_layout(taskbar_hwnd: int, entry: dict) -> None:
         _layout_by_hwnd.pop(next(iter(_layout_by_hwnd)))
     _landing_seq += 1
     stored = {k: entry.get(k) for k in _LAYOUT_ENTRY_KEYS}
-    stored.update(ts=time.monotonic(), seq=_landing_seq, interim=False)
+    # probe_start: when this result's UIA call began (taskbar_layout_landed_since).
+    stored.update(ts=time.monotonic(), seq=_landing_seq, interim=False, probe_start=entry.get("probe_start"))
     if stored["widgets"] is not None:
         stored.update(last_widgets=stored["widgets"], last_widgets_content=stored["widgets_content"])
     else:
@@ -550,7 +551,7 @@ def _layout_worker() -> None:
                      overflow=valid_rect(overflow), widgets_content=valid_rect(content), bar=bar,
                      # From ONE window rect, not the union: an auto-hide bar sliding during the probe
                      # keeps its thickness, while the union grows (taskbar_layout_matches_bar).
-                     bar_shape=_bar_shape(bar_before or bar))
+                     bar_shape=_bar_shape(bar_before or bar), probe_start=probe_start)
         with _layout_lock:
             if background:
                 _layout_superseded.pop(int(hwnd), None)
@@ -868,6 +869,18 @@ def taskbar_layout_landed_count(taskbar_hwnd: Optional[int]) -> int:
         return int(entry.get("seq", 0)) if entry is not None else 0
 
 
+def taskbar_layout_landed_since(taskbar_hwnd: Optional[int], started_at: float) -> bool:
+    """A FRESH result for ``taskbar_hwnd`` landed whose probe began at or after ``started_at``
+    (time.monotonic()): a probe already running when the caller asked for one does not count. For the
+    #24 yield of a "Show on all taskbars" copy, whose background probes have no request generation."""
+    with _layout_lock:
+        if not taskbar_hwnd:
+            return False
+        entry = _layout_by_hwnd.get(int(taskbar_hwnd))
+        began = entry.get("probe_start") if entry is not None else None
+        return isinstance(began, (int, float)) and began >= started_at
+
+
 def find_classic_layout_hwnds(taskbar_hwnd: int) -> Tuple[int, int, int]:
     """``(start, rebar, tasksw)``: the hidden legacy ``Start`` child of the taskbar and the
     ``ReBarWindow32`` / ``MSTaskSwWClass`` pair, 0 for any that is missing. On Win11 26200 Explorer
@@ -980,18 +993,20 @@ def _query_widgets_rect_blocking(taskbar_hwnd: int) -> Optional[Tuple[int, int, 
 
 
 def rect_overlaps_x(left: float, right: float, widgets_rect: Optional[Tuple[int, int, int, int]],
-                    dpi_scale: float) -> bool:
+                    dpi_scale: float, origin: float = 0.0) -> bool:
     """
     True if the horizontal span ``[left, right]`` (logical px, e.g. the widget's own geometry) overlaps
     the Widgets/weather element's x-extent (``widgets_rect`` is physical px; converted via ``dpi_scale``).
 
     Used to decide the one-time #200 nudge. ``widgets_rect`` is the visible content extent (dead space
     excluded), so a widget that merely grazes the element's padding is correctly NOT counted as overlap.
+    ``origin`` is the screen's Qt x origin (screen_origin): 0 on the primary, where this is rect / dpi;
+    a secondary's physical rect converts around its own origin (physical_to_logical, #373).
     """
     if not widgets_rect or dpi_scale <= 0:
         return False
-    r_left = widgets_rect[0] / dpi_scale
-    r_right = widgets_rect[2] / dpi_scale
+    r_left = physical_to_logical(widgets_rect[0], origin, dpi_scale)
+    r_right = physical_to_logical(widgets_rect[2], origin, dpi_scale)
     return left < r_right and right > r_left
 
 
@@ -1963,13 +1978,14 @@ def vertical_taskbar_strip(taskbar_info: TaskbarInfo, edge: constants.TaskbarEdg
 
 
 def rect_overlaps_y(top: float, bottom: float, widgets_rect: Optional[Tuple[int, int, int, int]],
-                    dpi_scale: float) -> bool:
+                    dpi_scale: float, origin: float = 0.0) -> bool:
     """The side-bar twin of ``rect_overlaps_x``: True if ``[top, bottom]`` (logical px) overlaps the
     Widgets/weather element's y-extent. On a LEFT/RIGHT taskbar the widget and the Widgets button
     share the bar's whole width, so comparing x always "overlapped" (#200 nudge false positive)."""
     if not widgets_rect or dpi_scale <= 0:
         return False
-    return top < widgets_rect[3] / dpi_scale and bottom > widgets_rect[1] / dpi_scale
+    return (top < physical_to_logical(widgets_rect[3], origin, dpi_scale)
+            and bottom > physical_to_logical(widgets_rect[1], origin, dpi_scale))
 
 
 def dock_signature(taskbar_info: Optional[TaskbarInfo]) -> Optional[tuple]:
