@@ -546,6 +546,72 @@ def test_a_staged_copy_damaged_after_staging_is_refused_and_the_app_restarted(
     assert told.offered == [False]
 
 
+def test_explorer_metadata_in_the_staged_copy_passes_its_file_check(tmp_path, frozen_with_manifest):
+    """2.2.1: opening the staged folder in Explorer can drop a desktop.ini / Thumbs.db into it. The
+    install-folder check already tolerates exactly those; the staged-files check must too, or the
+    update is refused for a file Explorer wrote."""
+    staged = _make_staged(tmp_path)
+    frozen_with_manifest(staged)
+    (staged / "desktop.ini").write_text("[.ShellClassInfo]", encoding="utf-8")
+    (staged / "Thumbs.db").write_bytes(b"thumbs")
+    assert ua._staged_files_refusal(str(staged)) is None
+
+
+@pytest.mark.parametrize("extra", ["version.dll", "notes.txt", "_internal/desktop.ini"])
+def test_any_other_extra_file_in_the_staged_copy_is_still_refused(tmp_path, frozen_with_manifest,
+                                                                   extra):
+    """Only Explorer's own two names, and only at the top level - the same rule as the install
+    folder. A planted DLL, any unknown file, or a desktop.ini inside _internal is still refused."""
+    staged = _make_staged(tmp_path)
+    frozen_with_manifest(staged)
+    (staged / "desktop.ini").write_text("[.ShellClassInfo]", encoding="utf-8")
+    (staged / extra).write_bytes(b"x")
+    reason = ua._staged_files_refusal(str(staged))
+    assert reason and "unexpected" in reason
+
+
+def test_a_file_check_refusal_records_the_refused_version(tmp_path, restart_spy, frozen_with_manifest):
+    """2.2.1 review: the restarted (old) app re-offered the refused release the next day - a copy
+    that fails the same way each time looped daily. The refusal now names the staged version, which
+    the app turns into the "Not now" snooze (refused_update_versions)."""
+    from netspeedtray import __version__
+    install = _make_install(tmp_path)
+    staged = _make_staged(tmp_path)
+    frozen_with_manifest(staged)
+    (staged / "_internal" / "data.bin").unlink()
+    before = time.time()
+    assert ua.apply_update(str(install), None, str(staged)) == 3
+    (version, failed_at), = ua.refused_update_versions(str(install))
+    assert version == __version__.lstrip("vV")
+    assert before - 1 <= failed_at <= time.time() + 1
+
+
+def test_a_refusal_only_snoozes_the_install_it_was_for(tmp_path, restart_spy, frozen_with_manifest,
+                                                       monkeypatch):
+    """#538 review: the record is per profile. A portable copy's refusal must not snooze the
+    installed copy (or another portable one) on the same profile - only the app running from the
+    refused install folder reads it (by default: the running exe's folder)."""
+    install = _make_install(tmp_path)
+    staged = _make_staged(tmp_path)
+    frozen_with_manifest(staged)
+    (staged / "_internal" / "data.bin").unlink()
+    assert ua.apply_update(str(install), None, str(staged)) == 3
+    other = _make_install(tmp_path / "Program Files")
+    monkeypatch.setattr(ua, "_running_dir", lambda: str(other))
+    assert ua.refused_update_versions() == []
+    monkeypatch.setattr(ua, "_running_dir", lambda: str(install).upper())   # case-insensitive match
+    assert len(ua.refused_update_versions()) == 1
+
+
+def test_other_refusals_record_no_refused_version(tmp_path, restart_spy):
+    """Only the staged copy's own file check snoozes the release: a refusal about the install folder
+    (a user's file in it) is fixed by the user, and the next offer should come as usual."""
+    install = _make_install(tmp_path)
+    (install / "my-notes.txt").write_text("mine", encoding="utf-8")
+    assert ua.apply_update(str(install), None, str(_make_staged(tmp_path))) == 3
+    assert ua.refused_update_versions(str(install)) == []
+
+
 def test_other_refusals_still_offer_the_staged_copy(tmp_path, restart_spy):
     """Only a copy that failed its own file check is withheld; a refusal about the install folder
     (here: a user's file in it) still points to the good staged copy for the guided update."""
@@ -674,6 +740,29 @@ def test_the_swap_carries_explorer_metadata_and_the_backup_stays_removable(
         ctypes.windll.kernel32.SetFileAttributesW(str(install), 0x10)
 
 
+def test_the_staged_copys_explorer_metadata_never_replaces_the_users(tmp_path):
+    """#541 review: once the staged-files check tolerated a staged desktop.ini, the swap's copytree
+    copied it into the new install; _carry_explorer_metadata then skipped the user's own (the name was
+    taken), so it survived only in the backup - which the janitor deletes, since the new install's
+    top level now listed desktop.ini. The staged copy's top-level Explorer files are not copied; the
+    user's are carried as before."""
+    install = _make_install(tmp_path)
+    (install / "desktop.ini").write_text("user", encoding="utf-8")
+    staged = _make_staged(tmp_path)
+    (staged / "desktop.ini").write_text("staged", encoding="utf-8")
+    (staged / "Thumbs.db").write_bytes(b"staged-thumbs")
+    (staged / "_internal" / "desktop.ini").write_text("nested", encoding="utf-8")
+
+    backup = ua.swap(str(install), str(staged))
+    assert (install / ua.APP_EXE).read_text(encoding="utf-8") == "new"
+    assert (install / "desktop.ini").read_text(encoding="utf-8") == "user", "the user's file was replaced"
+    assert not (install / "Thumbs.db").exists(), "the staged copy's thumbnail cache was copied in"
+    assert (install / "_internal" / "desktop.ini").read_text(encoding="utf-8") == "nested", (
+        "only the top level is skipped")
+    # The user's file is now in the install, so the backup may go - and the janitor's check agrees.
+    assert ua._portable_tree_refusal(backup, allowed_extra=os.listdir(install)) is None
+
+
 def test_a_refused_staged_copy_leaves_the_marker_older_sweeps_read(tmp_path, restart_spy):
     """The app restarted after a refusal is often an OLDER build, whose sweep deletes every folder
     in staged_update.json ten minutes after staging - the folder the notice sends the user to."""
@@ -696,3 +785,37 @@ def test_a_refused_staged_copy_leaves_the_marker_older_sweeps_read(tmp_path, res
     failures = json.loads((marker.parent / ua._BACKUPS_RECORD_NAME).read_text(encoding="utf-8"))
     assert any(r.get("kind") == "failure" and r.get("staged") == str(staged) for r in failures)
     assert staged.is_dir() and told and told[0][1] == str(staged)
+
+
+# ------------------------------------- the janitor's write-back keeps every failure record (#538)
+
+def test_a_sweep_keeps_each_failure_record_of_one_install(tmp_path, marker):
+    """#538 review (pre-existing): every failure record of one install shared one merge key, so the
+    sweep's write-back replaced the older records with the newest, twice over. A failed restore
+    followed by a later refusal came out as the refusal twice - and the restore_failed record, the
+    backup's never-expires protection (review-2 M3), was gone."""
+    install = str(tmp_path / "NetSpeedTray")
+    backup = str(tmp_path / ("NetSpeedTray" + ua._BACKUP_SUFFIX + "-1"))
+    now = time.time()
+    restore_failed = {"kind": "failure", "install": install, "staged": str(tmp_path / "s1"),
+                      "failed_at": now - 30 * 24 * 3600, "restore_failed": True, "backup": backup}
+    refusal = {"kind": "failure", "install": install, "staged": str(tmp_path / "s2"),
+               "failed_at": now - 60, "refused_version": "9.9.9"}
+    ua._write_list(ua._backups_path(), [restore_failed, refusal])
+    assert ua._norm(backup) in ua._restore_failed_backups()
+
+    ua._sweep_once()
+
+    after = ua._read_backup_records()
+    assert sorted(after, key=lambda r: r["failed_at"]) == [restore_failed, refusal]
+    assert ua._norm(backup) in ua._restore_failed_backups()
+
+
+def test_a_sweep_still_drops_an_expired_failure_and_keeps_the_rest(tmp_path, marker):
+    install = str(tmp_path / "NetSpeedTray")
+    now = time.time()
+    old = {"kind": "failure", "install": install, "failed_at": now - ua._FAILED_KEEP_SEC - 60}
+    recent = {"kind": "failure", "install": install, "failed_at": now - 60}
+    ua._write_list(ua._backups_path(), [old, recent])
+    ua._sweep_once()
+    assert ua._read_backup_records() == [recent]

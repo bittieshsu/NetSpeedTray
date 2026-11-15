@@ -38,13 +38,9 @@ from netspeedtray.core import gpu_adapters
 from netspeedtray.core.lhm_http import LhmGpu, LhmHttpClient, LhmSensor, LhmSnapshot, SourceOutage, gpu_groups
 from netspeedtray.utils import secret_store
 from netspeedtray.utils.rdp_utils import is_rdp_session
-from netspeedtray.utils.network_utils import get_connected_network_identity
+from netspeedtray.utils.network_identity_monitor import NetworkIdentityMonitor
 
 logger = logging.getLogger("NetSpeedTray.StatsMonitorThread")
-
-# Network identity (Wi-Fi band / SSID) changes rarely, so poll it on a slow sub-cadence off the
-# per-second network readout - never on the GUI thread. See releases/v2.1/KICKOFF.md §2/§3.
-_IDENTITY_POLL_INTERVAL_SEC: float = 5.0
 
 # LibreHardwareMonitor identifier prefixes that scope a sensor to something that is NOT the CPU.
 # The CPU-temperature search falls back to matching sensor *names* (for boards that label the die
@@ -87,6 +83,47 @@ def memory_collection_gates(config: Dict[str, Any], force: bool) -> Tuple[bool, 
             collect_gpu or bool(config.get('monitor_vram_enabled', False)))
 
 
+class GpuEngineUtilization(NamedTuple):
+    """One `\\GPU Engine(*)\\Utilization Percentage` array, parsed ONCE per poll (2.2.1): the taskbar
+    readout, the hover card's per-GPU rows and the Optimus gate all read it. Parsing it for each of
+    them cost ~6 ms a pass on a big array (hundreds of processes x engines), three times a poll on a
+    hybrid laptop - doubled at the 0.5 s rate. Built by parse_gpu_engine_utilization; the rules are
+    aggregate_gpu_engine_utilization's."""
+    per_adapter: Dict[Tuple[int, int], float]   # adapter LUID -> its busiest engine (processes summed)
+    unparsed: Tuple[float, ...]                 # instances no engine can be read from: one engine each
+
+    def busiest(self, luid: Optional[Tuple[int, int]] = None) -> float:
+        """The busiest engine on any adapter (unparsed instances included), or on ``luid`` only."""
+        if luid is not None:
+            return self.per_adapter.get(tuple(luid), 0.0)
+        return max(max(self.per_adapter.values(), default=0.0), max(self.unparsed, default=0.0))
+
+
+def parse_gpu_engine_utilization(samples: Dict[Any, Any]) -> GpuEngineUtilization:
+    """Parse a `\\GPU Engine(*)\\Utilization Percentage` array once - see
+    aggregate_gpu_engine_utilization for the rules."""
+    engines: Dict[Tuple[int, int, int, int], float] = {}
+    unparsed: List[float] = []
+    match_instance = constants.gpu.ENGINE_INSTANCE_PATTERN.match
+    for instance, value in samples.items():
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        value = float(value)
+        if not math.isfinite(value) or value < 0.0:
+            continue
+        match = match_instance(instance) if isinstance(instance, str) else None
+        if not match:
+            unparsed.append(0.0 + value)   # as the per-engine sum would hold it (-0.0 -> 0.0)
+            continue
+        luid_high, luid_low, phys, eng = match.groups()
+        key = (int(luid_high, 16), int(luid_low, 16), int(phys), int(eng))
+        engines[key] = engines.get(key, 0.0) + value
+    per_adapter: Dict[Tuple[int, int], float] = {}
+    for key, value in engines.items():
+        per_adapter[key[:2]] = max(per_adapter.get(key[:2], 0.0), value)
+    return GpuEngineUtilization(per_adapter, tuple(unparsed))
+
+
 def aggregate_gpu_engine_utilization(samples: Dict[Any, Any],
                                      luid: Optional[Tuple[int, int]] = None) -> float:
     """Busiest-engine GPU utilization from a `\\GPU Engine(*)\\Utilization Percentage` array.
@@ -105,52 +142,18 @@ def aggregate_gpu_engine_utilization(samples: Dict[Any, Any],
 
     ``luid`` (the GPU picker, #236): only that adapter's engines count, and unparseable instances -
     which cannot be attributed to any adapter - are dropped. None (Automatic) is the readout above.
+
+    One-shot form; a poll parses its array once (parse_gpu_engine_utilization) and reads that.
     """
-    engines: Dict[Any, float] = {}
-    for instance, value in samples.items():
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
-            continue
-        value = float(value)
-        if not math.isfinite(value) or value < 0.0:
-            continue
-        match = (constants.gpu.ENGINE_INSTANCE_PATTERN.match(instance)
-                 if isinstance(instance, str) else None)
-        if match:
-            luid_high, luid_low, phys, eng = match.groups()
-            key: Any = (int(luid_high, 16), int(luid_low, 16), int(phys), int(eng))
-            if luid is not None and key[:2] != tuple(luid):
-                continue
-        elif luid is not None:
-            continue
-        else:
-            key = ("unparsed", instance)
-        engines[key] = engines.get(key, 0.0) + value
-    return max(engines.values(), default=0.0)
+    return parse_gpu_engine_utilization(samples).busiest(luid)
 
 
 def per_adapter_engine_utilization(samples: Dict[Any, Any]) -> Dict[Tuple[int, int], float]:
     """{adapter LUID: its busiest engine's utilization} from the same array, by the same rules as
     aggregate_gpu_engine_utilization with a picked ``luid`` - each adapter's value is exactly what
     picking it would read (the hover card's per-GPU rows, #236). Unparseable instances belong to no
-    adapter and are left out. Not clamped here."""
-    engines: Dict[Tuple[int, int, int, int], float] = {}
-    for instance, value in samples.items():
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
-            continue
-        value = float(value)
-        if not math.isfinite(value) or value < 0.0:
-            continue
-        match = (constants.gpu.ENGINE_INSTANCE_PATTERN.match(instance)
-                 if isinstance(instance, str) else None)
-        if not match:
-            continue
-        luid_high, luid_low, phys, eng = match.groups()
-        key = (int(luid_high, 16), int(luid_low, 16), int(phys), int(eng))
-        engines[key] = engines.get(key, 0.0) + value
-    out: Dict[Tuple[int, int], float] = {}
-    for key, value in engines.items():
-        out[key[:2]] = max(out.get(key[:2], 0.0), value)
-    return out
+    adapter and are left out. Not clamped here. One-shot form, like aggregate_gpu_engine_utilization."""
+    return dict(parse_gpu_engine_utilization(samples).per_adapter)
 
 
 def _smi_number(parts: List[str], index: int, lo: float, hi: float) -> Optional[float]:
@@ -173,7 +176,8 @@ def _is_intel_group(gpu: LhmGpu) -> bool:
 
 class GpuPollResult(NamedTuple):
     """Structured result from GPU polling, replacing opaque 4-tuple."""
-    util: float = 0.0
+    # None = no reading this poll (the first sample after a query rebuild): the readout is held.
+    util: Optional[float] = 0.0
     vram_used: Optional[float] = None
     vram_total: Optional[float] = None
     temp: Optional[float] = None
@@ -183,6 +187,9 @@ class GpuPollResult(NamedTuple):
     vram_is_shared: bool = False
     # A PDH engine instance or a hardware-scoped LHM GPU sensor proves presence.
     present: bool = False
+    # A PICKED NVIDIA dGPU on a hybrid laptop (2.2.1): True = idle by the Optimus gate AND its temperature /
+    # power are "—" because of that (_gpu_idle_for), False = not that, None = not judged / not that case.
+    idle: Optional[bool] = None
 
 
 class GpuCard(NamedTuple):
@@ -198,6 +205,10 @@ class GpuCard(NamedTuple):
     temp: Optional[float] = None
     power: Optional[float] = None
     picked: bool = False              # the GPU picked in Settings: the one the taskbar shows
+    # A hybrid laptop's NVIDIA dGPU (2.2.1, _gpu_idle_for): True = idle by the Optimus gate and its
+    # temperature / power blank because of it, False = judged but not that (awake, or another source such
+    # as LHM still reads it), None = not judged (another GPU, a desktop, temperature and power both off).
+    idle: Optional[bool] = None
 
 
 class StatsMonitorThread(QThread):
@@ -240,6 +251,10 @@ class StatsMonitorThread(QThread):
         # LibreHardwareMonitor / OpenHardwareMonitor WMI object.
         # None = not yet tried, False = tried and unavailable, object = connected.
         self._wmi_ohm: Any = None
+        # Monotonic time before which a failed LHM/OHM WMI probe is not repeated (0.0 = probe now).
+        self._ohm_retry_at: float = 0.0
+        # Monotonic time of the first probe (None = none yet): the start of its every-poll grace.
+        self._ohm_first_probe_at: Optional[float] = None
         # One INFO line when a WMI connection that was working is dropped mid-session, one when it is
         # back (rate-limited if it flaps) - see SourceOutage.
         self._ohm_outage = SourceOutage(self.logger, "the LibreHardwareMonitor/OpenHardwareMonitor WMI source")
@@ -261,7 +276,11 @@ class StatsMonitorThread(QThread):
         self._thermal_placeholder_logged: set = set()
         self._lhm_notice_emitted: bool = False  # One-time notification flag
         self._lhm_check_since: Optional[float] = None  # monotonic ts of the first poll that wanted a sensor
-        self._last_identity_poll: float = 0.0  # monotonic ts of the last network-identity sub-poll (0 = poll immediately)
+        self._network_identity_monitor = NetworkIdentityMonitor()
+        self._last_emitted_network_identity = None
+        self._network_identity_update_requested = threading.Event()
+        self._network_identity_update_lock = threading.Lock()
+        self._com_initialized = False
         self._last_link_stats_poll: float = 0.0  # monotonic ts of the last net_if_stats sub-poll (v8 link history)
         self._nvidia_smi_path: Optional[str] = self._get_cached_path("nvidia-smi")
         # The helper process in flight, if any - stop() kills it (see _run_child).
@@ -303,6 +322,17 @@ class StatsMonitorThread(QThread):
         # monotonic time of the last \GPU Engine CollectQueryData: the next utilization sample covers
         # (this, next collection], which is how a sample that spans our own nvidia-smi call is told.
         self._gpu_collect_at: Optional[float] = None
+        # The first utilization sample after a query (re)build covers only the moment between the
+        # priming collection and the next one - a near-zero window whose value is noise (2.2.1). That
+        # poll holds the readout (util None: the taskbar keeps its last value) and is not counted by
+        # the Optimus gate. Set by _init_gpu_query, cleared by the next collection.
+        self._gpu_util_settling: bool = False
+        # The hover card's "Idle" tag (2.2.1): (the NVIDIA adapters the Optimus gate judged on the last
+        # poll - empty = not judged, whether it found them idle with nvidia-smi healthy). Kept as is over
+        # ONE poll whose engine array could not be read (the blind path), so a transient PDH failure
+        # does not take the tag's row away from an open card and rebuild it twice.
+        self._gpu_idle_gate: Tuple[frozenset, bool] = (frozenset(), False)
+        self._gpu_idle_gate_kept: bool = False
 
         # PDH Queries for GPU
         self._gpu_query: Optional[int] = None
@@ -501,6 +531,7 @@ class StatsMonitorThread(QThread):
             # Initial collection to prime
             win32pdh.CollectQueryData(self._gpu_query)
             self._gpu_collect_at = time.monotonic()
+            self._gpu_util_settling = self._gpu_util_counter is not None
             return True
         except Exception as e:
             self.logger.error("Failed to initialize GPU PDH query: %s", e)
@@ -519,6 +550,7 @@ class StatsMonitorThread(QThread):
             self._gpu_vram_counter = None
             self._gpu_shared_counter = None
             self._gpu_collect_at = None
+            self._gpu_util_settling = False
             # _gpu_engine_seen is deliberately NOT reset: a settings change or a resume rebuilds
             # the query, and forgetting that this machine has a GPU would blink the Monitor's GPU
             # tiles out until the next non-idle tick.
@@ -560,10 +592,13 @@ class StatsMonitorThread(QThread):
 
         # The utilization sample read below covers (window_start, this collection] (Optimus gate).
         window_start = self._gpu_collect_at
+        # The first sample after a (re)build (see _gpu_util_settling): held, and not judged by the gate.
+        settling = False
         if self._gpu_query:
             try:
                 win32pdh.CollectQueryData(self._gpu_query)
                 self._gpu_collect_at = time.monotonic()
+                settling, self._gpu_util_settling = self._gpu_util_settling, False
 
                 # 1. Utilization of the busiest engine, its processes summed (#328) - what Task Manager
                 # shows. The wildcard re-expands each collection, so processes started after us count.
@@ -622,10 +657,13 @@ class StatsMonitorThread(QThread):
         # 2c. A GPU that came or went since the DXGI list was read (G4), then the picked one (#236).
         self._refresh_adapters_on_luid_change(set(dedicated_mib) | set(shared_mib))
         selected = self._selected_gpu_adapter()
+        # Parsed once: the readout here, the Optimus gate below and the hover list (_gpu_cards) all
+        # read this one structure (None = no array, or it could not be parsed).
+        engine_util: Optional[GpuEngineUtilization] = None
         if util_arr is not None:
             try:
-                util_pct = aggregate_gpu_engine_utilization(
-                    util_arr, selected.luid if selected is not None else None)
+                engine_util = parse_gpu_engine_utilization(util_arr)
+                util_pct = engine_util.busiest(selected.luid if selected is not None else None)
             except Exception as e:
                 self.logger.debug("GPU utilization aggregation failed: %s", e)
         if selected is not None and dedicated_read_ok:
@@ -703,6 +741,7 @@ class StatsMonitorThread(QThread):
         smi_pick: Tuple[Optional[float], Optional[float], Optional[float]] = (None, None, None)
         hybrid = bool(self._nvidia_smi_path) and smi_matches and self._is_hybrid_laptop()
         gate_open = may_query = True
+        gate_luids: List[Tuple[int, int]] = []   # the NVIDIA adapters the gate judged this poll
         self._nvidia_interval_now = self._NVIDIA_POLL_INTERVAL_SEC
         if hybrid:
             if self._gpu_util_counter is None or util_arr is None:
@@ -719,10 +758,17 @@ class StatsMonitorThread(QThread):
                     self.logger.info("GPU utilization unavailable; nvidia-smi is polled without the "
                                      "sleep check on this hybrid PC (every %d s on battery).",
                                      int(constants.gpu.HYBRID_BLIND_BATTERY_POLL_SEC))
-            else:
+            elif include_temp or include_power:
                 nvidia_luids = [a.luid for a in gpu_adapters.hardware_adapters(self._gpu_adapters or [])
                                 if a.vendor_id == constants.gpu.VENDOR_NVIDIA] if selected is None else [selected.luid]
-                gate_open, may_query = self._nvidia_awake(util_arr, nvidia_luids, window_start)
+                gate_open, may_query = self._nvidia_awake(
+                    engine_util.per_adapter if engine_util is not None else {}, nvidia_luids, window_start,
+                    settling=settling)
+                gate_luids = nvidia_luids
+            # else: GPU temperature and power both off - nvidia-smi cannot be asked this poll (the total
+            # is never a reason on a hybrid), so the gate is not judged (2.2.1). Nothing else reads it
+            # then: the hover list drops temperature / power with the same switches, the LHM notice
+            # needs one of them on, and the next poll that wants them judges its own sample first.
             if not gate_open:
                 need_smi_temp = need_smi_power = False
                 # Asleep: no reading is kept for later - not on the taskbar, not in the hover list.
@@ -732,6 +778,15 @@ class StatsMonitorThread(QThread):
         self._nvidia_gate_open = gate_open
         # A known sensor that is only asleep (no failure so far): not "no sensor" (the LHM notice).
         self._gpu_sensor_asleep = hybrid and not gate_open and self._nvidia_fail_streak == 0
+        # Which cards that verdict is about - the hover card's "Idle" tag (2.2.1). A poll that could not
+        # read the engine array keeps the last verdict once (see _gpu_idle_gate).
+        blind_blip = (hybrid and self._gpu_util_counter is not None and util_arr is None
+                      and (include_temp or include_power))
+        if blind_blip and not self._gpu_idle_gate_kept:
+            self._gpu_idle_gate_kept = True
+        else:
+            self._gpu_idle_gate_kept = False
+            self._gpu_idle_gate = (frozenset(gate_luids), self._gpu_sensor_asleep)
         if selected is None:
             # On a hybrid the total alone is never a reason to call (owner decision 2026-11-11: zero
             # wakes at app start): DXGI's below until a temperature / power query brings nvidia-smi's.
@@ -849,15 +904,19 @@ class StatsMonitorThread(QThread):
 
         # Clamp utilization to [0, 100] - a per-engine sum can momentarily read >100%.
         util_pct = max(constants.gpu.UTIL_MIN_PERCENT, min(constants.gpu.UTIL_MAX_PERCENT, util_pct))
+        # The first sample after a query rebuild is not a reading: held (None), never a blip (2.2.1).
+        util: Optional[float] = None if settling else util_pct
         # The inputs, for the hover card's per-GPU list (_gpu_cards): read once here, reused there.
-        self._gpu_poll_inputs = (util_arr, dedicated_mib if dedicated_read_ok else None, shared_mib,
+        self._gpu_poll_inputs = (engine_util, dedicated_mib if dedicated_read_ok else None, shared_mib,
                                  lhm_snapshot, selected, temp_c, power_w, rapl_w)
         # LHM's HardwareId-scoped sensor group is independent evidence that a physical GPU
         # exists. Keeping the row visible with 0% utilization is intentional when PDH is
         # unavailable: temperature/power remain useful and are not fabricated.
-        return GpuPollResult(util_pct, vram_used, vram_total, temp_c, power_w,
+        return GpuPollResult(util, vram_used, vram_total, temp_c, power_w,
                              vram_is_shared=vram_is_shared,
-                             present=self._gpu_engine_seen or self._lhm_gpu_seen)
+                             present=self._gpu_engine_seen or self._lhm_gpu_seen,
+                             idle=(self._gpu_idle_for(selected.luid, temp_c, power_w)
+                                   if selected is not None else None))
 
     def _dxgi_vram_total(self) -> Optional[float]:
         """Total VRAM (MiB) from DXGI's static adapter facts, for VRAM shown without GPU monitoring in
@@ -947,7 +1006,7 @@ class StatsMonitorThread(QThread):
         real = gpu_adapters.hardware_adapters(self._gpu_adapters or [])
         if len(real) < 2 or self._gpu_poll_inputs is None:
             return ()
-        (util_arr, dedicated_mib, shared_mib, snapshot, selected, sel_temp, sel_power,
+        (engine_util, dedicated_mib, shared_mib, snapshot, selected, sel_temp, sel_power,
          rapl_w) = self._gpu_poll_inputs
         # Automatic showing RAPL PP1 as the GPU power: that IS the Intel iGPU's, so its row shows the
         # same value as the taskbar (one source of truth) - only when exactly one Intel iGPU exists.
@@ -955,11 +1014,7 @@ class StatsMonitorThread(QThread):
                        and gpu_adapters.is_integrated(a)]
         rapl_card = intel_igpus[0] if rapl_w is not None and selected is None and len(intel_igpus) == 1 else None
         cards = sorted(real, key=gpu_adapters.is_integrated)   # stable: DXGI order within each side
-        try:
-            utils = per_adapter_engine_utilization(util_arr) if util_arr is not None else None
-        except Exception as e:
-            self.logger.debug("GPU per-adapter utilization failed: %s", e)
-            utils = None
+        utils = engine_util.per_adapter if engine_util is not None else None   # the poll's parse
         groups = snapshot.gpus if snapshot is not None and snapshot.gpus else self._gpu_wmi_groups
         sensors = LhmSnapshot(gpus=tuple(groups)) if groups else None
         nvidia = [a for a in real if a.vendor_id == constants.gpu.VENDOR_NVIDIA]
@@ -1014,12 +1069,13 @@ class StatsMonitorThread(QThread):
                 if auto_smi_fresh and a is nvidia[0]:
                     temp = temp if temp is not None else self._nvidia_cache_temp
                     power = power if power is not None else self._nvidia_cache_power
+            temp = temp if include_temp else None
+            power = power if include_power else None
             out.append(GpuCard(
                 luid=a.luid, name=name, integrated=integrated, util=util,
                 vram_used_gib=used / 1024.0 if used is not None else None,
                 vram_total_gib=total / 1024.0 if total else None, vram_shared=shared,
-                temp=temp if include_temp else None, power=power if include_power else None,
-                picked=picked))
+                temp=temp, power=power, picked=picked, idle=self._gpu_idle_for(a.luid, temp, power)))
 
         sig = tuple((hex(a.vendor_id), gpu_adapters.is_integrated(a)) for a in cards)
         if sig != self._gpu_cards_sig:
@@ -1206,10 +1262,10 @@ class StatsMonitorThread(QThread):
         except Exception:
             return False
 
-    def _nvidia_awake(self, util_arr: Dict[Any, Any], luids: List[Tuple[int, int]],
-                      window_start: Optional[float]) -> Tuple[bool, bool]:
+    def _nvidia_awake(self, utils: Dict[Tuple[int, int], float], luids: List[Tuple[int, int]],
+                      window_start: Optional[float], settling: bool = False) -> Tuple[bool, bool]:
         """(awake, may_query) for a hybrid's NVIDIA dGPU, from this tick's PDH engine utilization
-        (PDH never wakes a GPU).
+        (PDH never wakes a GPU) - ``utils`` is the poll's parsed per-adapter busiest engine.
 
         A utilization sample covers (window_start, its collection]. A sample whose window holds our
         last nvidia-smi call is ambiguous - if querying a sleeping dGPU registers as engine activity,
@@ -1219,22 +1275,36 @@ class StatsMonitorThread(QThread):
 
         Awake: activity above HYBRID_DGPU_AWAKE_MIN_UTIL_PERCENT in an unambiguous sample within the
         hold - HYBRID_DGPU_AWAKE_HOLD_SEC, or HYBRID_DGPU_AWAKE_HOLD_WINDOWS sample windows at slow
-        update rates, so one ambiguous sample in between never closes it."""
+        update rates, so one ambiguous sample in between never closes it.
+
+        ``settling``: the first sample after a query (re)build - a near-zero window, so it is treated
+        like an ambiguous one (not counted, no new call), and its length does not shrink the hold."""
         g = constants.gpu
         now = time.monotonic()
         ran = self._nvidia_smi_ran_at
-        clean = ran is None or (window_start is not None and window_start > ran)
-        self._gpu_window_sec = now - window_start if window_start is not None else 0.0
-        try:
-            utils = per_adapter_engine_utilization(util_arr) if util_arr else {}
-        except Exception as e:
-            self.logger.debug("GPU per-adapter utilization failed: %s", e)
-            utils = {}
+        clean = not settling and (ran is None or (window_start is not None and window_start > ran))
+        if not settling:
+            self._gpu_window_sec = now - window_start if window_start is not None else 0.0
         if clean and any(utils.get(luid, 0.0) > g.HYBRID_DGPU_AWAKE_MIN_UTIL_PERCENT for luid in luids):
             self._nvidia_active_at = now
         hold = max(g.HYBRID_DGPU_AWAKE_HOLD_SEC, g.HYBRID_DGPU_AWAKE_HOLD_WINDOWS * self._gpu_window_sec)
         awake = self._nvidia_active_at is not None and now - self._nvidia_active_at <= hold
         return awake, clean
+
+    def _gpu_idle_for(self, luid: Tuple[int, int], temp: Optional[float],
+                      power: Optional[float]) -> Optional[bool]:
+        """The hover card's "Idle" tag for one adapter (2.2.1), from its FINAL temperature / power.
+
+        True only when the Optimus gate judged THIS card on the last poll, found it idle with nvidia-smi
+        healthy (_gpu_sensor_asleep), and the readings the card shows are blank - so its "—" are the
+        gate's doing. The gate only knows "no engine activity within the hold", which is why the tag says
+        idle, not asleep. False when judged but that is not the case: awake, nvidia-smi failing, or
+        another source (LHM / OHM) still reads it - a live 45 °C never sits next to "Idle". None when
+        not judged at all (the row then has no tag)."""
+        luids, idle = self._gpu_idle_gate
+        if luid not in luids:
+            return None
+        return bool(idle) and temp is None and power is None
 
     def _refresh_adapters_on_luid_change(self, pdh_instances) -> None:
         """Re-read the DXGI adapter list when PDH's GPU set no longer matches it (rc.2 G4).
@@ -1620,14 +1690,24 @@ class StatsMonitorThread(QThread):
         and caches the WMI connection in self._wmi_ohm.
         _wmi_ohm == None  → not yet probed (or previous probe failed - will retry)
         _wmi_ohm == <obj> → connected and ready
-        Failures are NOT permanently cached so the probe retries each poll cycle,
-        allowing the app to pick up LHM/OHM if it starts after NetSpeedTray.
+        Failures are NOT permanently cached, so the app picks up LHM/OHM if it starts after
+        NetSpeedTray - but in the steady "never found" state a failed probe is not repeated for
+        constants.lhm.WMI_PROBE_BACKOFF_SEC (2.2.1): it used to run on every poll, up to three times a
+        poll, wherever no namespace exists (every NVIDIA desktop without LHM). Still every poll: for
+        NOT_DETECTED_GRACE_SEC after the first probe (LHM's WMI coming up at login, or initialising
+        with 0 sensors) and while a connection that worked is lost (a one-poll hiccup recovers on the
+        next poll, as before). A settings change (run) probes again at once.
         """
         if self._wmi_ohm is not None:
+            return
+        now = time.monotonic()
+        if now < self._ohm_retry_at:
             return
         com_client = _com_client()
         if com_client is None:
             return
+        if self._ohm_first_probe_at is None:
+            self._ohm_first_probe_at = now
         # Probe every namespace BEFORE deciding on any user-facing guidance: a working
         # fallback (e.g. a live root\OpenHardwareMonitor) must not trigger a misleading
         # "install LHM v0.9.4" note just because the LHM namespace happens to be absent
@@ -1663,6 +1743,10 @@ class StatsMonitorThread(QThread):
         # Nothing connected across all namespaces. A source that worked earlier is still (or newly)
         # lost: SourceOutage reports a folded outage that outlasts its quiet window (no-op otherwise).
         self._ohm_outage.failed("no LibreHardwareMonitor/OpenHardwareMonitor WMI namespace answered")
+        # Back off only in the steady "never found" state (see the docstring).
+        in_grace = now - self._ohm_first_probe_at < constants.lhm.NOT_DETECTED_GRACE_SEC
+        if not (in_grace or self._ohm_outage.lost):
+            self._ohm_retry_at = now + constants.lhm.WMI_PROBE_BACKOFF_SEC
         # Surface ONE actionable line, once.
         if not self._ohm_guidance_logged:
             self._ohm_guidance_logged = True
@@ -1686,7 +1770,7 @@ class StatsMonitorThread(QThread):
                     "Options > Remote Web Server (port %d).", "; ".join(probe_errors),
                     self._lhm_http.host, self._lhm_http.port, self._lhm_http.port
                 )
-        # Leave _wmi_ohm as None so we retry next poll (LHM may not be running yet)
+        # Leave _wmi_ohm as None so we retry after the backoff (LHM may not be running yet)
 
     def _poll_cpu_temperature(self) -> Optional[float]:
         """
@@ -1937,6 +2021,8 @@ class StatsMonitorThread(QThread):
                     self._cleanup_thermal_query()
                     self._cleanup_power_query()
                     self._wmi_ohm = None   # re-probe LHM/OHM on the next temp poll
+                    self._ohm_retry_at = 0.0   # now, not after a failed probe's backoff,
+                    self._ohm_first_probe_at = None   # with a fresh every-poll grace
 
                 stats = {}
 
@@ -1958,14 +2044,8 @@ class StatsMonitorThread(QThread):
                         except Exception as e:
                             self.logger.debug("net_if_stats failed: %s", e)
 
-                # 1b. Network identity (Wi-Fi band / SSID) - only when the widget wants it, and only
-                # on the slow sub-cadence. get_connected_network_identity() never raises. Emitting on
-                # a present key lets the controller forward it exactly like the temp/power stats.
-                if self.config.get('show_network_identity', False):
-                    now = time.monotonic()
-                    if now - self._last_identity_poll >= _IDENTITY_POLL_INTERVAL_SEC:
-                        self._last_identity_poll = now
-                        stats['network_identity'] = get_connected_network_identity()
+                # The event-driven cache does no Windows work on unchanged ticks.
+                self._collect_network_identity(stats)
 
                 # Monitor-window override forces hardware collection even with the widget's flags off.
                 _force_hw = self._force_hardware_collection
@@ -2010,8 +2090,13 @@ class StatsMonitorThread(QThread):
                         gpu = self._poll_gpu_hybrid(include_temp=include_temp, include_power=include_power,
                                                     memory_only=not _collect_gpu)
 
-                        if _collect_gpu:
+                        # util None = the first sample after a query rebuild: no key, so the taskbar
+                        # and the history keep the last reading instead of a near-zero-window blip.
+                        if _collect_gpu and gpu.util is not None:
                             stats['gpu'] = gpu.util
+                            # The picked dGPU's "Idle" verdict for the single GPU row (2.2.1) - not on a
+                            # held tick either: its gate verdict comes from the same sliver of a sample.
+                            stats['gpu_idle'] = gpu.idle
                         stats['gpu_present'] = gpu.present   # lets the Monitor hide GPU tiles on no-GPU boxes
                         if include_temp:
                             stats['gpu_temp'] = gpu.temp
@@ -2029,7 +2114,9 @@ class StatsMonitorThread(QThread):
                         # this poll's reads, live display only - the controller never persists it.
                         # () = no list (one GPU). A failed poll sends no key at all, so a transient
                         # PDH/driver error keeps the list the card already shows.
-                        if list_gpus:
+                        # Not on a held poll either: its per-card utilization is the same noise, and no
+                        # key keeps the list the card already shows.
+                        if list_gpus and gpu.util is not None:
                             cards = self._gpu_cards(include_temp, include_power)
                             stats['gpu_cards'] = cards if len(cards) >= 2 else ()
                     except Exception as gpu_err:
@@ -2052,6 +2139,9 @@ class StatsMonitorThread(QThread):
                     self._error_notified = False
 
             except Exception as e:
+                # A later collector may fail after identity collection but before stats_ready.
+                # Resend on recovery so that a changed identity or resume request is not lost.
+                self._last_emitted_network_identity = None
                 self.consecutive_errors += 1
                 self.logger.error("Error fetching stats (consecutive=%d): %s", self.consecutive_errors, e)
 
@@ -2078,6 +2168,7 @@ class StatsMonitorThread(QThread):
                 time.sleep(sleep_slice)
                 sleep_remaining -= sleep_slice
 
+        self._network_identity_monitor.close()
         self._cleanup_gpu_query()
         self._cleanup_thermal_query()
         self._cleanup_power_query()
@@ -2094,20 +2185,50 @@ class StatsMonitorThread(QThread):
         self._wmi_ohm = None
 
     def _init_com(self) -> None:
-        """Initialize the COM apartment ONCE for this thread (WMI/LHM access)."""
+        """Use MTA for WMI and WinRT callbacks; this polling thread has no STA message pump."""
+        self._com_initialized = False
         try:
             import pythoncom
-            pythoncom.CoInitialize()
-        except Exception:
-            pass
+            pythoncom.CoInitializeEx(pythoncom.COINIT_MULTITHREADED)
+            self._com_initialized = True
+        except Exception as e:
+            self.logger.debug("Monitor COM initialization unavailable: %s", e)
 
     def _cleanup_com(self) -> None:
-        """Releases COM apartment initialized for WMI access."""
+        """Balance this worker's successful COM initialization only."""
+        if self._com_initialized:
+            try:
+                import pythoncom
+                pythoncom.CoUninitialize()
+            except Exception as e:
+                self.logger.debug("Monitor COM cleanup failed: %s", e)
+            finally:
+                self._com_initialized = False
+
+    def request_network_identity_update(self) -> None:
+        """Ask the worker to resend its current identity after the live view resumes."""
+        with self._network_identity_update_lock:
+            self._network_identity_update_requested.set()
+
+    def _collect_network_identity(self, stats: Dict[str, Any]) -> None:
+        """Emit changed identities and one requested refresh, keeping WinRT on this worker."""
+        if not self.config.get('show_network_identity', False):
+            self._network_identity_monitor.close()
+            self._last_emitted_network_identity = None
+            return
+        # Consume before reading so a resume request arriving during the query is retained.
+        with self._network_identity_update_lock:
+            force_update = self._network_identity_update_requested.is_set()
+            self._network_identity_update_requested.clear()
         try:
-            import pythoncom
-            pythoncom.CoUninitialize()
+            identity = self._network_identity_monitor.read(self.config.get('identity_mode', 'band'))
         except Exception:
-            pass
+            if force_update:
+                self.request_network_identity_update()
+            raise
+        if force_update or identity != self._last_emitted_network_identity:
+            stats['network_identity'] = identity
+            self._last_emitted_network_identity = identity
 
     def _run_child(self, argv, timeout: float) -> str:
         """Run a short-lived helper (nvidia-smi) and return its stdout, like check_output - but the

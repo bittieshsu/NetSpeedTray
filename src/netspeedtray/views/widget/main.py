@@ -8,7 +8,7 @@ import os
 import sys
 import time
 from ctypes import wintypes
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 # --- Third-Party Imports ---
@@ -194,6 +194,11 @@ def hover_gpu_rows(config: Dict[str, Any], cards: Any, bar_shows_gpu: bool = Tru
             row["temp"] = c.temp
         if power:
             row["power"] = c.power
+        idle = getattr(c, "idle", None)
+        if (temps or power) and idle is not None:
+            # A hybrid's NVIDIA dGPU (2.2.1): the key says the card can be idle (its tag is laid out),
+            # the value whether it is now - so the tag shows and hides without a rebuild.
+            row["idle"] = bool(idle)
         if vram:
             row["vram"] = (c.vram_used_gib, c.vram_total_gib)
             if c.vram_shared:
@@ -332,7 +337,6 @@ class NetworkSpeedWidget(QWidget):
         self.gpu_usage: float = float('nan')
         self.network_identity: Optional[object] = None  # NetworkIdentity|None: Wi-Fi band/SSID, set by update_network_identity (v2.1)
         self._identity_reserve_sig_last: object = None  # last identity reserve signature (band-shown, ssid); re-layout on change
-        self._location_prompt_shown: bool = False  # SSID Location nudge shown at most once per session
         self._widgets_nudge_shown: bool = False  # #200 Widgets/weather overlap nudge, once per session
         self.gpu_present: bool = False  # LATCHES True once any poll detects GPU counters (never flips
         #                                 back - a GPU doesn't vanish), so the Monitor's GPU tile shows
@@ -374,6 +378,9 @@ class NetworkSpeedWidget(QWidget):
         # Every GPU of a multi-GPU PC (monitor_thread.GpuCard), for the hover card's list (#236). Set
         # by the controller on every hardware poll; () with one GPU, GPU monitoring off or the list off.
         self.gpu_cards: tuple = ()
+        # A PICKED hybrid dGPU as the Optimus gate judged it (2.2.1): True = idle (the hover card's single
+        # GPU row says so beside its "—"), False = not, None = not judged. Set by the controller.
+        self.gpu_idle: Optional[bool] = None
         
         # Cycling State
         self._cycle_index: int = 0
@@ -499,6 +506,7 @@ class NetworkSpeedWidget(QWidget):
         # outlived a manual check that FOUND an update and fired on the next automatic one (#508).
         self.update_checker.up_to_date.connect(self._on_update_check_up_to_date)
         self.update_checker.check_failed.connect(self._on_update_check_failed)
+        self._snooze_refused_update()
         if self.update_checker.should_check():
             # Offered like every automatic check: a flyout behind the same gates (fullscreen, nobody
             # at the screen, a modal up), never a dialog the user did not ask for (#508).
@@ -1055,6 +1063,9 @@ class NetworkSpeedWidget(QWidget):
         self.logger.info("Resuming widget updates")
         self.is_paused = False
         self._paused_histories = None
+        monitor = getattr(self, "monitor_thread", None)
+        if monitor is not None:
+            monitor.request_network_identity_update()
         self.update()
 
 
@@ -1098,18 +1109,14 @@ class NetworkSpeedWidget(QWidget):
     def update_network_identity(self, identity: Optional[object]) -> None:
         """Update the connected network's identity (Wi-Fi band / SSID) and repaint if shown.
 
-        `identity` is a NetworkIdentity (or None). Sub-polled ~5s in StatsMonitorThread, never on the
-        hot path. The on-widget rendering + width reserve land with the identity element (KICKOFF §3);
-        for now we store the value so the paint path can read it and repaint when the feature is on.
+        `identity` is a NetworkIdentity (or None), cached on the stats worker and refreshed on
+        network changes or by its safety interval. Store it for the paint path and update the layout.
         """
         if self.is_paused:
             return
         self.network_identity = identity
         if not self.config.get("show_network_identity", False):
             return
-        # The user asked for the network name but Windows Location is off (SSID came back blocked):
-        # explain once why, and how, rather than silently showing nothing.
-        self._maybe_prompt_location(identity)
         # The reserved identity slot depends on which band shows (alert_only flips on/off 2.4G) and on
         # the SSID text (variable width). Both change only on a network change (rare), so re-lay out on
         # that transition - keeping the widget tight - and otherwise just repaint.
@@ -1449,8 +1456,7 @@ class NetworkSpeedWidget(QWidget):
     def _identity_ssid_text(self) -> Optional[str]:
         """The truncated SSID / connection name to draw, or None (off, band-only mode, or unavailable).
 
-        Location-gated: for Wi-Fi with Location off, `NetworkIdentity.name` is None (ssid_blocked) and
-        this returns None - the band still shows and Settings explains why (never a blank/fake name).
+        A missing connected-profile name stays unavailable; it is not replaced with a stale SSID.
         """
         if not self.config.get("show_network_identity", False):
             return None
@@ -1963,6 +1969,9 @@ class NetworkSpeedWidget(QWidget):
                             hw["temp_unit"] = unit   # absent = Celsius, the snapshot as before
                     if power:
                         stat["power"] = watts
+                    idle = getattr(self, "gpu_idle", None) if key == "gpu" else None
+                    if (temps or power) and idle is not None:
+                        stat["idle"] = bool(idle)   # the picked hybrid dGPU (2.2.1), as in the list
                     hw[key] = stat
             if ("CPU" in stats or "RAM" in stats) and cfg.get("monitor_ram_enabled", False):
                 hw["ram"] = (self.ram_used, self.ram_total)
@@ -3012,6 +3021,31 @@ class NetworkSpeedWidget(QWidget):
         except Exception as e:
             self.logger.debug("Automatic update check (%s) failed to start: %s", reason, e)
 
+    def _snooze_refused_update(self) -> None:
+        """A portable update the applier refused at its pre-swap file check restarted this (old)
+        version; without a hold the next automatic check re-offers that release, and a copy that
+        fails the same way each time loops daily. So record the "Not now" snooze for it, counted
+        from the refusal - written here, by the app's own config path (the applier never writes the
+        user's config). A manual check still shows it."""
+        try:
+            from netspeedtray.core.update_applier import refused_update_versions
+            from netspeedtray.core.update_checker import format_snooze, snooze_suppresses
+            refused = refused_update_versions()
+            if not refused:
+                return
+            version, failed_at = refused[-1]
+            snooze_s = constants.app.UPDATE_NOT_NOW_SNOOZE_S
+            snooze = format_snooze(version, snooze_s, datetime.fromtimestamp(failed_at, timezone.utc))
+            current = self.config.get("update_snooze", "")
+            if not snooze_suppresses(snooze, version, snooze_s) or snooze_suppresses(current, version, snooze_s):
+                return   # expired, or already held (this snooze, or a newer version's)
+            self.config["update_snooze"] = snooze
+            self.update_config({"update_snooze": snooze})
+            self.logger.info("Update %s was refused at its file check; not re-offering it before %s.",
+                             version, snooze.rpartition("@")[2])
+        except Exception as e:
+            self.logger.warning("Could not snooze a refused update: %s", e)
+
     def _update_recently_dismissed(self, version: str) -> bool:
         """'Not now' (config ``update_snooze``, survives restarts) holds automatic offers of that
         version back for UPDATE_NOT_NOW_SNOOZE_S; a newer release is offered at once."""
@@ -3069,6 +3103,13 @@ class NetworkSpeedWidget(QWidget):
             self._pending_update_offer = None
             return
         try:
+            # The offer may have waited (fullscreen, idle) past the user turning automatic checks
+            # off, or IT pushing the policy: then it is dropped, not shown. The checker's own gate.
+            from netspeedtray.core.update_checker import automatic_update_checks_allowed
+            if not automatic_update_checks_allowed(getattr(self, "config", None) or {}):
+                self._pending_update_offer = None
+                self.logger.info("Update %s not offered: automatic update checks are now off.", offer[0])
+                return
             if self._update_offer_blocked():
                 timer = getattr(self, "_update_offer_retry_timer", None)
                 if timer is not None:
@@ -3220,35 +3261,6 @@ class NetworkSpeedWidget(QWidget):
                 open_external(LHM_RELEASES_URL)
         except Exception as e:
             self.logger.error("Error showing temperature onboarding: %s", e, exc_info=True)
-
-    def _maybe_prompt_location(self, identity: Optional[object]) -> None:
-        """One-time, honest explainer when the user wants the SSID but Windows Location is off.
-
-        Fires at most once per session and is suppressible forever. Only when the network name was
-        actually requested (ssid/both mode) and actually blocked - never for band-only users.
-        """
-        try:
-            if identity is None or not getattr(identity, "ssid_blocked", False):
-                return
-            if self.config.get("identity_mode", "band") not in ("ssid", "both"):
-                return
-            if self._location_prompt_shown or self.config.get("location_onboarding_dismissed", False):
-                return
-            self._location_prompt_shown = True
-            from netspeedtray.views.location_onboarding_dialog import (
-                LocationOnboardingDialog, LOCATION_SETTINGS_URI,
-            )
-            dlg = LocationOnboardingDialog(self.i18n, self)
-            dlg.exec()
-            if dlg.dismissed_forever():
-                self.update_config({"location_onboarding_dismissed": True})
-            if dlg.action == LocationOnboardingDialog.ACTION_OPEN_LOCATION:
-                from PyQt6.QtGui import QDesktopServices
-                from PyQt6.QtCore import QUrl
-                QDesktopServices.openUrl(QUrl(LOCATION_SETTINGS_URI))
-        except Exception as e:
-            self.logger.error("Error showing location onboarding: %s", e, exc_info=True)
-
 
     def _maybe_nudge_widgets_overlap(self, taskbar_info) -> None:
         """One-time heads-up (#200): if the widget currently overlaps the Win11 Widgets/weather panel's

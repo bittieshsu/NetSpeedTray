@@ -60,6 +60,12 @@ my_hidden_imports = [
     'PyQt6.QtGui',
     'PyQt6.QtWidgets',
     'psutil',
+    # PyWinRT 3.2.1 dynamically projects these types; it has no automatic hook.
+    'winrt.runtime',
+    'winrt.system',
+    'winrt.windows.foundation',
+    'winrt.windows.foundation.collections',
+    'winrt.windows.networking.connectivity',
     'win32api',
     # Imported lazily by monitor.py's single-instance check (per-user instance scan); a missing one
     # there would fall back to psutil, then assume an instance is running - keep them bundled.
@@ -359,6 +365,14 @@ if not any(name == 'truststore' or name.startswith('truststore.') for name, *_ i
     raise SystemExit("[netspeedtray.spec] FATAL: 'truststore' is missing from the bundle "
                      "(pip install -r requirements.txt). Update checks would fail on fresh installs.")
 print('[netspeedtray.spec] truststore bundled: HTTPS verified by Windows.')
+# Same failure mode for the Wi-Fi name (#493): a venv without the winrt-* packages only logs the
+# missing hidden imports, and the frozen app silently never shows the network name.
+_winrt_names = {name.replace('\\', '.').replace('/', '.').lower() for name, *_ in a.binaries + a.pure}
+for _need in ('winrt._winrt', 'winrt.windows.networking.connectivity'):
+    if not any(n == _need or n.startswith(_need + '.') for n in _winrt_names):
+        raise SystemExit(f"[netspeedtray.spec] FATAL: '{_need}' is missing from the bundle "
+                         "(pip install -r requirements.txt). The Wi-Fi name would never show.")
+print('[netspeedtray.spec] winrt bundled: the Wi-Fi name can be read.')
 # 2.2.1: the portable updater checks every file against the manifest signed into the new exe, and
 # fails closed: without this module every portable update would be refused. It is imported lazily
 # (inside functions), so make sure the analysis found it.

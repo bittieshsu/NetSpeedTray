@@ -430,7 +430,8 @@ def swap(install_dir: str, staged_dir: str) -> str:
                         "install is at: %s", install_dir, backup)
         raise _RestoreFailed(backup, "install path re-created during the swap: %s" % e)
     try:
-        shutil.copytree(staged_dir, install_dir, dirs_exist_ok=True)
+        shutil.copytree(staged_dir, install_dir, dirs_exist_ok=True,
+                        ignore=_staged_explorer_metadata(staged_dir))
         problem = _copy_mismatch(staged_dir, install_dir)
         if problem:
             raise RuntimeError("the copied install does not match the staged copy: %s" % problem)
@@ -489,13 +490,30 @@ def _carry_explorer_metadata(backup: str, install_dir: str) -> None:
         logger.debug("Could not carry the folder's Explorer metadata.", exc_info=True)
 
 
+def _staged_explorer_metadata(staged_dir: str):
+    """copytree ``ignore`` callback: Explorer's metadata (``_EXPLORER_METADATA``) at the TOP level of
+    the staged copy is not copied. The staged-files check tolerates it there (someone opened the
+    staged folder in Explorer), but it is not part of the release - and copied in, it would take the
+    place of the user's own desktop.ini, which _carry_explorer_metadata then skips, leaving it only in
+    a backup the janitor deletes. Below the top level nothing is skipped."""
+    root = os.path.normcase(os.path.abspath(staged_dir))
+
+    def ignore(src, names):
+        if os.path.normcase(os.path.abspath(src)) != root:
+            return set()
+        return {n for n in names if n.lower() in _EXPLORER_METADATA}
+    return ignore
+
+
 def _copy_mismatch(staged_dir: str, install_dir: str) -> Optional[str]:
     """None when ``install_dir`` holds what ``staged_dir`` holds at the top level and the EXE is the
     same size; else what differs. A cheap check that the swap really produced the new version
-    before anything is marked applied - and so before the old copy becomes deletable."""
+    before anything is marked applied - and so before the old copy becomes deletable. Explorer's
+    metadata is left out on both sides: the swap does not copy the staged copy's, and carries the
+    user's own in afterwards (``_carry_explorer_metadata``)."""
     try:
-        want = sorted(n.lower() for n in os.listdir(staged_dir))
-        got = sorted(n.lower() for n in os.listdir(install_dir))
+        want = sorted(n.lower() for n in os.listdir(staged_dir) if n.lower() not in _EXPLORER_METADATA)
+        got = sorted(n.lower() for n in os.listdir(install_dir) if n.lower() not in _EXPLORER_METADATA)
         if want != got:
             return "top-level entries differ"
         if (os.path.getsize(os.path.join(staged_dir, APP_EXE))
@@ -995,10 +1013,44 @@ def _staged_files_refusal(staged_dir: str) -> Optional[str]:
         return None
     try:
         from netspeedtray.utils.bundle_manifest import verify_app_folder
-        verify_app_folder(staged_dir, os.path.join(staged_dir, APP_EXE))
+        # Explorer's folder metadata is tolerated here exactly as in the install-folder check: a
+        # desktop.ini or Thumbs.db appears as soon as someone opens the staged folder in Explorer.
+        # Any other extra file is still a refusal.
+        verify_app_folder(staged_dir, os.path.join(staged_dir, APP_EXE),
+                          tolerated_top_level=_EXPLORER_METADATA)
         return None
     except Exception as e:
         return "the staged copy failed its file check: %s" % (str(e) or e.__class__.__name__)
+
+
+def _own_version() -> Optional[str]:
+    """This code's version - the STAGED version: the applier runs from the staged copy. Lazy, so
+    this module stays stdlib-only; None if it cannot be read."""
+    try:
+        from netspeedtray import __version__
+        return str(__version__).lstrip("vV").strip() or None
+    except Exception:
+        return None
+
+
+def refused_update_versions(install_dir: Optional[str] = None) -> List[Tuple[str, float]]:
+    """(version, failed_at) for every update whose staged copy the applier refused at its file
+    check (``refused_version`` in the backups record), oldest first. Read by the app at start-up
+    to snooze that version's automatic offer. Only refusals for ``install_dir`` (default: the
+    running app's folder) count: the record is per profile, and an installed copy must not be
+    snoozed by a portable copy's refusal. Never raises."""
+    out = []
+    try:
+        here = install_dir if install_dir is not None else _running_dir()
+        for rec in _read_backup_records():
+            version, failed_at = rec.get("refused_version"), rec.get("failed_at")
+            if rec.get("kind") == "failure" and isinstance(version, str) and version \
+                    and isinstance(failed_at, (int, float)) and not isinstance(failed_at, bool) \
+                    and _same_path(rec["install"], here):
+                out.append((version, float(failed_at)))
+    except Exception:
+        logger.debug("Could not read refused updates.", exc_info=True)
+    return sorted(out, key=lambda vf: vf[1])
 
 
 def apply_update(install_dir: str, wait_pid: Optional[int], staged_dir: Optional[str] = None) -> int:
@@ -1030,7 +1082,11 @@ def apply_update(install_dir: str, wait_pid: Optional[int], staged_dir: Optional
     if reason:
         logger.warning("Refusing to apply the update: the staged copy no longer matches its "
                        "manifest: %s", reason)
-        _note_applier_outcome(staged_dir, applied=False, install_dir=install_dir)
+        # The version is recorded so the restarted app snoozes its automatic offer like "Not now"
+        # (refused_update_versions) - else the next day's check re-offers it, and a copy that fails
+        # the same way every time (an antivirus quarantining one DLL) makes that a daily loop.
+        _note_applier_outcome(staged_dir, applied=False, install_dir=install_dir,
+                              refused_version=_own_version())
         # Restart and say why - but never point the user at this copy to install by hand: it is
         # the one that just failed (a missing DLL would leave them a broken app). The next update
         # check offers the release again and downloads a fresh, re-verified copy.
@@ -1205,7 +1261,8 @@ def _read_staged_paths() -> List[dict]:
 
 def _read_backup_records() -> List[dict]:
     """``{"kind": "backup", "path", "install", "applier_pid"}`` and
-    ``{"kind": "failure", "install", "failed_at"[, "restore_failed", "backup"]}`` records."""
+    ``{"kind": "failure", "install", "failed_at"[, "restore_failed", "backup", "refused_version"]}``
+    records."""
     out = []
     for item in _read_list(_backups_path()):
         if isinstance(item, dict) and item.get("kind") in ("backup", "failure") \
@@ -1259,8 +1316,18 @@ def _write_entries(entries: List[dict]) -> None:
     _write_list(_marker_path(), entries)
 
 
-def _entry_key(entry: dict) -> Tuple[str, str]:
-    return (entry.get("kind") or "staged", _norm(entry.get("path") or entry.get("install") or ""))
+def _entry_key(entry: dict) -> Tuple[str, ...]:
+    kind = entry.get("kind") or "staged"
+    key: Tuple[str, ...] = (kind, _norm(entry.get("path") or entry.get("install") or ""))
+    if kind == "failure":
+        # One install collects several failure records (a failed restore, a later refusal...). Keyed
+        # by the install alone, the sweep's write-back merge replaced every one with the newest -
+        # twice over - and a restore_failed record, the backup's only protection, was lost (#538
+        # review). What a record says and when (fields the sweep never changes) tells them apart.
+        key += (repr(entry.get("failed_at")), str(entry.get("staged") or ""),
+                str(entry.get("backup") or ""), str(entry.get("refused_version") or ""),
+                str(bool(entry.get("restore_failed"))))
+    return key
 
 
 def record_staged_path(path: str, package: Optional[str] = None) -> None:
@@ -1290,7 +1357,8 @@ def record_staged_path(path: str, package: Optional[str] = None) -> None:
 
 def _note_applier_outcome(staged_dir: str, *, applied: bool, backup: Optional[str] = None,
                           install_dir: Optional[str] = None,
-                          restore_failed_backup: Optional[str] = None) -> None:
+                          restore_failed_backup: Optional[str] = None,
+                          refused_version: Optional[str] = None) -> None:
     """The applier's half of the record: mark the staged entry applied (or failed) in the staged
     marker, and record the backup the swap made - or the failure - in the backups record, so the
     relaunched version knows exactly what it may remove, and what it must not.
@@ -1349,6 +1417,8 @@ def _note_applier_outcome(staged_dir: str, *, applied: bool, backup: Optional[st
                         # No expiry: this backup is the only complete copy of the user's app.
                         rec.update(restore_failed=True,
                                    backup=os.path.abspath(restore_failed_backup))
+                    if refused_version:
+                        rec["refused_version"] = refused_version
                     records.append(rec)
                 _write_list(_backups_path(), records)
     except Exception:
