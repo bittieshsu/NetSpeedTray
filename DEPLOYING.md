@@ -93,8 +93,17 @@ Turning the app off in Task Manager's Startup tab also stops it.
 
 ## Updates
 
-- **Checking:** when the app starts, at most once every 24 hours, it asks GitHub's API
-  (`api.github.com`) for the latest release. Prereleases are never offered.
+- **Checking:** at most once every 24 hours, the app asks GitHub's API (`api.github.com`) for the
+  latest release. It looks for a due check 5 s after it starts, every 3 hours while it runs and 60 s
+  after a wake from sleep (a PC that sleeps instead of rebooting can keep one instance for weeks);
+  GitHub is contacted only when the last successful check is more than 24 hours old, so a failed
+  check (offline, say) is retried at the next of those. Prereleases are never offered.
+- **Offering:** an automatic check offers a new version with a non-modal notice that opens the update
+  dialog only when clicked - never a dialog the user did not ask for. The notice waits (retried every
+  60 s) while a fullscreen app or a modal dialog is up, the session is locked or in a screen saver, or
+  there has been no keyboard/mouse input for 2 minutes. **Not Now** in the dialog holds back automatic
+  offers of that version for 3 days, across restarts (`update_snooze` in the config); a newer release
+  is offered at once. Only the right-click **Check for Updates** opens the dialog directly.
 - **Turning it off for everyone:** set the machine-wide policy value
   `HKLM\SOFTWARE\Policies\NetSpeedTray DisableUpdateCheck` (a DWORD; any nonzero value turns it on,
   and a value of another type is ignored with a warning in the log). The app then never checks on its
@@ -106,7 +115,7 @@ Turning the app off in Task Manager's Startup tab also stops it.
   ```
   reg add "HKLM\SOFTWARE\Policies\NetSpeedTray" /v DisableUpdateCheck /t REG_DWORD /d 1 /f
   ```
-- **Turning it off per user:** **Check for updates on startup** in Settings → General, or
+- **Turning it off per user:** **Check for updates automatically** in Settings → General, or
   `"check_for_updates": false` in `NetSpeedTray_Config.json` while the app is closed. Users can still
   choose **Check for Updates** from the right-click menu.
 - **Installing:** the user clicks Download; the app checks the download's Authenticode signature and the
@@ -115,19 +124,20 @@ Turning the app off in Task Manager's Startup tab also stops it.
 - **Portable updates are checked differently:** the portable zip is many files, not one signed
   installer. The app checks the zip's SHA-256 against the release's `checksums.txt` (both fetched over
   HTTPS from the GitHub release), then checks the Authenticode signature and the SignPath publisher of
-  the extracted `NetSpeedTray.exe` before anything is staged; if either check fails, nothing is staged,
-  the current version keeps running and the release page opens. The rest of the bundle (`_internal\`)
-  is vouched for by the checksum only - exactly as trustworthy as downloading the zip from the release
-  page yourself.
+  the extracted `NetSpeedTray.exe`, and then every other file of the new version against a list of
+  SHA-256 hashes that the build embeds inside that exe before it is signed - so the signature vouches
+  for the whole bundle, `_internal\` included, not just the exe (since 2.2.1). A missing, extra or
+  changed file is refused. If any check fails, nothing is staged, the current version keeps running
+  and the release page opens.
 - **Pinning a version:** turn the check off as above and deploy the version you want.
 
 ## Network activity
 
 | What | Destination | When | Default | Turn off |
 |---|---|---|---|---|
-| Update check | HTTPS to `api.github.com` | At start, at most once per 24 h, and from the right-click menu | On | Settings → General → Check for updates on startup, or the policy above |
+| Update check | HTTPS to `api.github.com` | At most once per 24 h (looked for at start, every 3 h and after a wake; a failed check is retried), and from the right-click menu | On | Settings → General → Check for updates automatically, or the policy above |
 | Update download | HTTPS to `github.com` release assets (redirects to GitHub's download CDN), plus a certificate revocation check to the certificate authority | Only when a user clicks Download | - | The policy or the toggle above (no check, no offer) |
-| Latency check | ICMP echo to the default gateway | Four every 3 s (about 1.3/s), 12-byte payload `netspeedtray` | On | Settings → Network Interfaces → Connection latency |
+| Latency check | ICMP echo to the default gateway (a connected physical adapter's, when there are several) | Four every 3 s (about 1.3/s), 12-byte payload `netspeedtray` | On | Settings → Network Interfaces → Connection latency |
 | Internet latency | ICMP echo to `1.1.1.1` (or the host you set) | Same rate, in addition | **Off** | Same card |
 | DNS lookup | Your normal DNS server | Once per burst (every 3 s), only if the internet host is a *name* | Off | Use an IP address |
 | Check connection | 20 pings, 200 ms apart, to the gateway (and the internet host if enabled or ticked) | Only when a user clicks it, even while the latency check is off | - | - |
@@ -135,9 +145,13 @@ Turning the app off in Task Manager's Startup tab also stops it.
 | LibreHardwareMonitor | HTTP to `127.0.0.1:8085/data.json` (this PC only) | While temperature or power readings are on, or the Monitor window is open; retried every 30 s while LHM doesn't answer | - | Stop LHM's web server (or don't run LHM) |
 | Metrics endpoint | **Listens** on `127.0.0.1` and `[::1]`, port 9184 | While turned on | **Off** | Settings → Advanced → Integrations |
 
-The latency check pings the first IPv4 default gateway Windows lists. While a VPN is connected that can
-be the VPN's own gateway, so the latency pings can go through the tunnel to the VPN provider. The app
-needs no inbound port unless you turn on the metrics endpoint, and that one listens on this PC only. Full detail: [privacy.md](privacy.md).
+The latency check pings the default gateway of a connected physical adapter (Ethernet or Wi-Fi) when
+the PC has more than one default route, so a full-tunnel VPN's own default route does not turn the
+"router" hop into one across the internet. With no physical adapter's default route it uses the route
+Windows uses (or, if the route table cannot be read, the first IPv4 default gateway Windows lists);
+while a VPN is connected that can be the VPN's own gateway, so the latency pings can go through the
+tunnel to the VPN provider. The app needs no inbound port unless you turn on the metrics endpoint, and
+that one listens on this PC only. Full detail: [privacy.md](privacy.md).
 
 <a id="metrics-endpoint"></a>
 ## Metrics endpoint (Prometheus / Grafana)
@@ -193,8 +207,15 @@ New-NetFirewallRule -DisplayName "Block LibreHardwareMonitor web server (inbound
 Setup.exe, the portable build's `NetSpeedTray.exe` and the installed `NetSpeedTray.exe` are signed by the
 SignPath Foundation. `unins000.exe` (Inno Setup's uninstaller) and the bundled third-party files in
 `_internal\` are not signed by SignPath; the third-party files keep their own publishers' signatures where
-they have one. Smart App Control: a clean install runs; upgrades are still being confirmed in
+they have one. Since 2.2.1 the signed `NetSpeedTray.exe` carries a SHA-256 of every bundled file (an
+`RT_RCDATA` resource named `NST_MANIFEST`, covered by its signature), which the portable updater
+checks. Smart App Control: a clean install runs; upgrades are still being confirmed in
 [issue #333](https://github.com/erez-c137/NetSpeedTray/issues/333).
+
+**Manifest format contract.** The manifest is format v1 (`{"v": 1, ...}`), and every shipped updater
+since 2.2.1 accepts only v1 and refuses an exe without it. Every future build must therefore keep
+embedding a v1-readable `NST_MANIFEST`; a new format goes in a second resource beside it (e.g.
+`NST_MANIFEST_V2`), never in place of it. A build-config test pins the embed step to v1.
 
 ## Rollback
 

@@ -81,8 +81,19 @@ def test_toggle_layout_gpu_view_with_only_cpu_recorded(renderer):
     assert COLLECTING in _texts(renderer.figure)
 
 
+@pytest.mark.parametrize("stat", ["hwcombined", "hwseparate"])
+def test_ram_only_recording_is_collecting_not_off(renderer, stat):
+    """2.2.1: RAM is recorded without CPU/GPU monitoring - its graph will fill, so an empty range is
+    "collecting", not "history is off"; with RAM off as well it is off."""
+    _render(renderer, stat, "TIMELINE_24_HOURS", history_off={**MON_OFF, "ram": None})
+    texts = _texts(renderer.figure)
+    assert COLLECTING in texts and OFF not in texts
+    _render(renderer, stat, "TIMELINE_24_HOURS", history_off={**MON_OFF, "ram": "monitor"})
+    assert OFF in _texts(renderer.figure)
+
+
 NO_HISTORY = I18N.NET_GRAPH_NO_HISTORY_YET
-NO_TRAFFIC = I18N.NET_GRAPH_NO_TRAFFIC
+NO_TRAFFIC = f"{I18N.NET_GRAPH_NO_TRAFFIC_TITLE}\n{I18N.NET_GRAPH_NO_TRAFFIC_REASON}"
 
 
 def test_empty_network_range_says_so_instead_of_a_flat_zero_line(renderer):
@@ -118,6 +129,23 @@ def test_empty_network_range_says_why(renderer):
     assert NO_TRAFFIC not in texts
 
 
+@pytest.mark.parametrize("lang", ["en_US", "de_DE", "zh_CN", "hu_HU"])
+def test_no_traffic_note_never_blames_the_apps_pause(monkeypatch, lang):
+    """#525 (RainThings): the note said the PC was "off, idle or paused", mixing PC states with the
+    app's own Pause. That Pause only freezes the widget's readout - history keeps recording - so it is
+    never why a period is empty: the note is the title line plus a PC-state / app-not-running line."""
+    i18n = I18nStrings(lang)
+    monkeypatch.setattr(GraphRenderer, "_init_matplotlib", _bare_init)
+    r = GraphRenderer(MagicMock(), i18n)
+    r._draw_net_empty_message("TIMELINE_WEEK", datetime(2026, 9, 3), datetime(2026, 9, 10),
+                              {"earliest": datetime(2026, 8, 1)})
+    text = r._net_empty_artist.get_text()
+    assert text == r._lbl(f"{i18n.NET_GRAPH_NO_TRAFFIC_TITLE}\n{i18n.NET_GRAPH_NO_TRAFFIC_REASON}")
+    assert "NET_GRAPH_NO_TRAFFIC" not in i18n._strings         # the mixed sentence is gone everywhere
+    en = I18nStrings("en_US").NET_GRAPH_NO_TRAFFIC_REASON
+    assert "paused" not in en.lower() and "asleep" in en and "NetSpeedTray" in en
+
+
 @pytest.mark.parametrize("stat", ["hwcombined", "hwseparate"])
 def test_cpu_monitored_but_not_recorded_points_to_the_record_switch(renderer, stat):
     """RC M6: CPU on + Record off (GPU off) said "turn on CPU or GPU monitoring" - but CPU IS on, and
@@ -138,7 +166,7 @@ def test_monitoring_on_or_session_view_still_says_collecting(renderer, stat):
 
 def test_hebrew_messages_are_shaped_for_matplotlib(monkeypatch):
     """matplotlib has no bidi: Hebrew must go through shape_rtl like every other graph label."""
-    from netspeedtray.utils.mpl_fonts import shape_rtl
+    from netspeedtray.utils.mpl_fonts import matplotlib_does_bidi, shape_rtl
     monkeypatch.setattr(GraphRenderer, "_init_matplotlib", _bare_init)
     he = I18nStrings("he_IL")
     r = GraphRenderer(MagicMock(), he)
@@ -147,7 +175,8 @@ def test_hebrew_messages_are_shaped_for_matplotlib(monkeypatch):
                              (RECORDING, "COLLECTING_DATA_MESSAGE")):
         _render(r, "hwcombined", "TIMELINE_24_HOURS", history_off)
         shaped = shape_rtl(getattr(he, key), "he_IL")
-        assert shaped != getattr(he, key) and shaped in _texts(r.figure)
+        # reshaped on matplotlib < 3.11; 3.11+ does its own bidi and gets the logical text
+        assert (shaped != getattr(he, key)) is not matplotlib_does_bidi() and shaped in _texts(r.figure)
     ax = r.figure.add_subplot(1, 1, 1)
     end = datetime.now()
     ax.set_xlim(end - timedelta(hours=2), end)
@@ -156,10 +185,14 @@ def test_hebrew_messages_are_shaped_for_matplotlib(monkeypatch):
 
 
 @pytest.mark.parametrize("cfg, off", [
-    ({}, MON_OFF),                                                        # 2.2 defaults
-    ({"monitor_cpu_enabled": True}, {"cpu": None, "gpu": "monitor"}),
-    ({"monitor_gpu_enabled": True}, {"cpu": "monitor", "gpu": None}),
-    ({"monitor_cpu_enabled": True, "monitor_gpu_enabled": True, "record_hardware_history": False}, REC_OFF),
+    ({}, {**MON_OFF, "ram": "monitor"}),                                  # 2.2 defaults
+    ({"monitor_cpu_enabled": True}, {"cpu": None, "gpu": "monitor", "ram": "monitor"}),
+    ({"monitor_gpu_enabled": True}, {"cpu": "monitor", "gpu": None, "ram": "monitor"}),
+    ({"monitor_cpu_enabled": True, "monitor_gpu_enabled": True, "record_hardware_history": False},
+     {**REC_OFF, "ram": "monitor"}),
+    # 2.2.1: RAM is recorded on its own switch, CPU monitoring off or not.
+    ({"monitor_ram_enabled": True}, {**MON_OFF, "ram": None}),
+    ({"monitor_ram_enabled": True, "record_hardware_history": False}, {**MON_OFF, "ram": "record"}),
 ])
 def test_graph_host_derives_reasons_from_the_writer_rule(q_app, cfg, off):
     from netspeedtray.views.monitor.graph_host import GraphHost

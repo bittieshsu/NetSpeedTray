@@ -7,6 +7,7 @@ from PyQt6.QtWidgets import QWidget
 
 from netspeedtray import constants
 from netspeedtray.utils.components import Win11Toggle, Win11Segmented, SettingCard, Win11ComboBox
+from netspeedtray.utils.helpers import line_spacing_px
 from netspeedtray.views.settings.pages._fluent import section_header, page_layout, as_int
 
 class UnitsPage(QWidget):
@@ -73,7 +74,29 @@ class UnitsPage(QWidget):
         self.short_unit_labels.toggled.connect(self.on_change)
         layout.addWidget(SettingCard(self.i18n.SHORT_UNIT_LABELS_LABEL, control=self.short_unit_labels))
 
+        # Extra px between the upload/download rows on top of the font's line height; 1 = old fixed gap.
+        # Shown as offsets from the default ("-4 .. -1, Default, +1 .. +4"); each segment's value is the
+        # stored px (default + offset). Raw px made "0" look like the default while "+1" was it.
+        defaults = constants.config.defaults
+        # wrap: the localized "Default" segment makes the row ~460-510 px - the widest control in
+        # Settings - so let it break onto two rows rather than raise the window's minimum width.
+        self.line_spacing = Win11Segmented([(self._line_spacing_text(v), v)
+                                            for v in range(defaults.LINE_SPACING_MIN, defaults.LINE_SPACING_MAX + 1)],
+                                           wrap=True)
+        self.line_spacing.valueChanged.connect(self.on_change)
+        layout.addWidget(SettingCard(self._tr("LINE_SPACING_LABEL", "Line spacing"),
+                                     description=self._tr("LINE_SPACING_OFFSET_DESCRIPTION",
+                                                          "Gap between the upload and download rows, "
+                                                          "in pixels from the default"),
+                                     control=self.line_spacing))
+
         layout.addStretch()
+
+    def _line_spacing_text(self, px: int) -> str:
+        """A line-spacing segment's text: "Default" for the default gap, else the signed px offset
+        from it ("-4" .. "+4")."""
+        offset = px - constants.config.defaults.DEFAULT_LINE_SPACING
+        return f"{offset:+d}" if offset else self._tr("LINE_SPACING_DEFAULT_OPTION", "Default")
 
     def load_settings(self, config: Dict[str, Any]):
         # Unit Type
@@ -96,7 +119,14 @@ class UnitsPage(QWidget):
         self.hide_arrows.setChecked(config.get("hide_arrows", False))
         self.hide_unit_suffix.setChecked(config.get("hide_unit_suffix", False))
         self.short_unit_labels.setChecked(config.get("short_unit_labels", constants.config.defaults.DEFAULT_SHORT_UNIT_LABELS))
-        
+        # The renderer's and the layout's rule (line_spacing_px), plus the range: the control has no
+        # segment for a value outside it and would keep no value at all.
+        defaults = constants.config.defaults
+        spacing = line_spacing_px(config.get("line_spacing"))
+        if not defaults.LINE_SPACING_MIN <= spacing <= defaults.LINE_SPACING_MAX:
+            spacing = defaults.DEFAULT_LINE_SPACING
+        self.line_spacing.setValue(spacing)
+
 
     def get_settings(self) -> Dict[str, Any]:
         speed_mode = "always_mbps" if self.speed_display_mode.isChecked() else "auto"
@@ -109,7 +139,8 @@ class UnitsPage(QWidget):
             "swap_upload_download": self.swap_upload_download.isChecked(),
             "hide_arrows": self.hide_arrows.isChecked(),
             "hide_unit_suffix": self.hide_unit_suffix.isChecked(),
-            "short_unit_labels": self.short_unit_labels.isChecked()
+            "short_unit_labels": self.short_unit_labels.isChecked(),
+            "line_spacing": self.line_spacing.value(),
         }
 
     def _on_force_mb_toggled(self, checked: bool) -> None:
